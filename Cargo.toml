@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "crates/solmusic-application",
+    "crates/solmusic-domain",
+    "crates/solmusic-sqlite",
+    "crates/solmusic-youtube",
+    "crates/tauri-plugin-solmusic-storage",
+    "src-tauri",
+]
+resolver = "2"

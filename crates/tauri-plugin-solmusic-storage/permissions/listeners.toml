@@ -1,0 +1,9 @@
+[[permission]]
+identifier = "allow-listeners"
+description = "Allows the SunnySong player to register and remove native media-control listeners."
+commands.allow = [
+  "register_listener",
+  "registerListener",
+  "remove_listener",
+  "removeListener"
+]
