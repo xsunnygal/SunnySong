@@ -1,17 +1,22 @@
-use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, Transaction};
 use solmusic_application::{
-    DatabaseDiagnostics, LibraryAlbum, LibraryFolder, LibraryScanResult, LibrarySource,
-    LibraryTrack, ListeningProfile, LocalArtist, LocalPlaybackFile, MusicDirectory,
-    MusicRepository, Playlist, PlaylistTrack, RecentSong, ScannedLocalTrack, StorageError,
+    DatabaseDiagnostics, DownloadRecord, HistoryEvent, LibraryAlbum, LibraryFolder,
+    LibraryScanResult, LibrarySource, LibraryTrack, ListeningProfile, ListeningRecap, LocalArtist,
+    LocalPlaybackFile, MusicDirectory, MusicRepository, Playlist, PlaylistExportTrack,
+    PlaylistItemSource, PlaylistTrack, RecapArtist, RecapCoverage, RecapSong, RecentSong,
+    ScannedLocalTrack, StorageError,
 };
 use solmusic_domain::{ArtistRef, ListeningSummary, Song, SongId, TrackProfile};
 use tracing::{debug, info};
 
-const LATEST_SCHEMA_VERSION: usize = 8;
+const LATEST_SCHEMA_VERSION: usize = 11;
 const MIGRATIONS: [&str; LATEST_SCHEMA_VERSION] = [
     r#"
     CREATE TABLE songs (
@@ -385,7 +390,58 @@ const MIGRATIONS: [&str; LATEST_SCHEMA_VERSION] = [
 
     INSERT INTO schema_migrations (version, name, applied_at_ms)
     VALUES (8, 'profile_playlists', CAST(strftime('%s', 'now') AS INTEGER) * 1000);
-"#,
+    "#,
+    r#"
+    CREATE TABLE history_coverage (
+        profile_id        TEXT PRIMARY KEY NOT NULL REFERENCES profiles(profile_id) ON DELETE CASCADE,
+        complete_from_ms  INTEGER NOT NULL,
+        legacy_incomplete INTEGER NOT NULL CHECK (legacy_incomplete IN (0, 1))
+    );
+    INSERT INTO history_coverage (profile_id, complete_from_ms, legacy_incomplete)
+    SELECT p.profile_id,
+           CASE WHEN COUNT(r.event_id) >= 1000
+                THEN COALESCE(MIN(r.started_at_ms), p.created_at_ms)
+                ELSE MIN(p.created_at_ms, COALESCE(MIN(r.started_at_ms), p.created_at_ms)) END,
+           COUNT(r.event_id) >= 1000
+    FROM profiles p
+    LEFT JOIN recent_plays r ON r.profile_id = p.profile_id
+    GROUP BY p.profile_id;
+
+    CREATE TABLE downloads (
+        download_id     TEXT PRIMARY KEY NOT NULL,
+        profile_id      TEXT NOT NULL REFERENCES profiles(profile_id) ON DELETE CASCADE,
+        song_id         TEXT NOT NULL REFERENCES songs(song_id) ON DELETE CASCADE,
+        status          TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed')),
+        location        TEXT,
+        file_name       TEXT,
+        error           TEXT,
+        created_at_ms   INTEGER NOT NULL,
+        completed_at_ms INTEGER
+    );
+    CREATE INDEX downloads_profile_created_idx
+        ON downloads(profile_id, created_at_ms DESC, download_id);
+
+    INSERT INTO schema_migrations (version, name, applied_at_ms)
+    VALUES (9, 'durable_history_coverage_and_downloads', CAST(strftime('%s', 'now') AS INTEGER) * 1000);
+    "#,
+    r#"
+    ALTER TABLE local_files ADD COLUMN replay_gain_track_db REAL;
+    ALTER TABLE local_files ADD COLUMN replay_gain_album_db REAL;
+    ALTER TABLE local_files ADD COLUMN replay_gain_track_peak REAL;
+    ALTER TABLE local_files ADD COLUMN replay_gain_album_peak REAL;
+
+    INSERT INTO schema_migrations (version, name, applied_at_ms)
+    VALUES (10, 'local_replaygain_metadata', CAST(strftime('%s', 'now') AS INTEGER) * 1000);
+    "#,
+    r#"
+    ALTER TABLE local_files ADD COLUMN modified_at_ns INTEGER;
+    ALTER TABLE local_files ADD COLUMN sidecar_artwork_path TEXT;
+    ALTER TABLE local_files ADD COLUMN sidecar_artwork_size_bytes INTEGER;
+    ALTER TABLE local_files ADD COLUMN sidecar_artwork_modified_at_ns INTEGER;
+
+    INSERT INTO schema_migrations (version, name, applied_at_ms)
+    VALUES (11, 'incremental_local_scans', CAST(strftime('%s', 'now') AS INTEGER) * 1000);
+    "#,
 ];
 
 const COMPLETION_EMA_ALPHA: f64 = 0.2;
@@ -575,17 +631,8 @@ impl MusicRepository for SqliteMusicRepository {
         )
         .map_err(storage_error)?;
 
-        tx.execute(
-            "DELETE FROM recent_plays
-             WHERE profile_id = ?1 AND sequence_id <= (
-                 SELECT sequence_id FROM recent_plays
-                 WHERE profile_id = ?1
-                 ORDER BY sequence_id DESC LIMIT 1 OFFSET ?2
-             )",
-            params![summary.profile_id, MAX_RECENT_PLAYS],
-        )
-        .map_err(storage_error)?;
-
+        // Version 9 makes event history durable. Older releases retained at most
+        // MAX_RECENT_PLAYS rows; history_coverage records that honest boundary.
         tx.commit().map_err(storage_error)
     }
 
@@ -769,6 +816,12 @@ impl MusicRepository for SqliteMusicRepository {
         tx.execute(
             "INSERT INTO profile_recommendation_state (profile_id, updated_at_ms)
              VALUES (?1, ?2)",
+            params![profile.id, now_ms],
+        )
+        .map_err(storage_error)?;
+        tx.execute(
+            "INSERT INTO history_coverage (profile_id, complete_from_ms, legacy_incomplete)
+             VALUES (?1, ?2, 0)",
             params![profile.id, now_ms],
         )
         .map_err(storage_error)?;
@@ -983,6 +1036,294 @@ impl MusicRepository for SqliteMusicRepository {
         Ok(item)
     }
 
+    fn rename_playlist(
+        &self,
+        playlist_id: &str,
+        name: &str,
+        now_ms: i64,
+    ) -> Result<Playlist, StorageError> {
+        let name = validated_playlist_name(name)?;
+        let connection = self.connection()?;
+        let profile_id = active_profile_id(&connection)?;
+        let changed = connection
+            .execute(
+                "UPDATE playlists SET name = ?1, updated_at_ms = ?2
+                 WHERE playlist_id = ?3 AND profile_id = ?4",
+                params![name, now_ms, playlist_id, profile_id],
+            )
+            .map_err(playlist_storage_error)?;
+        if changed == 0 {
+            return Err(StorageError("playlist was not found".into()));
+        }
+        connection
+            .query_row(
+                "SELECT p.playlist_id, p.name, p.created_at_ms, p.updated_at_ms,
+                        COUNT(i.song_id)
+                 FROM playlists p LEFT JOIN playlist_items i ON i.playlist_id = p.playlist_id
+                 WHERE p.playlist_id = ?1 AND p.profile_id = ?2 GROUP BY p.playlist_id",
+                params![playlist_id, profile_id],
+                playlist_from_row,
+            )
+            .map_err(storage_error)
+    }
+
+    fn delete_playlist(&self, playlist_id: &str) -> Result<(), StorageError> {
+        let connection = self.connection()?;
+        let profile_id = active_profile_id(&connection)?;
+        let changed = connection
+            .execute(
+                "DELETE FROM playlists WHERE playlist_id = ?1 AND profile_id = ?2",
+                params![playlist_id, profile_id],
+            )
+            .map_err(storage_error)?;
+        if changed == 0 {
+            return Err(StorageError("playlist was not found".into()));
+        }
+        Ok(())
+    }
+
+    fn remove_song_from_playlist(
+        &self,
+        playlist_id: &str,
+        song_id: &SongId,
+        now_ms: i64,
+    ) -> Result<(), StorageError> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction().map_err(storage_error)?;
+        let profile_id = active_profile_id(&tx)?;
+        ensure_playlist_exists(&tx, &profile_id, playlist_id)?;
+        let position: i64 = tx
+            .query_row(
+                "SELECT position FROM playlist_items WHERE playlist_id = ?1 AND song_id = ?2",
+                params![playlist_id, song_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage_error)?
+            .ok_or_else(|| StorageError("song was not found in playlist".into()))?;
+        tx.execute(
+            "DELETE FROM playlist_items WHERE playlist_id = ?1 AND song_id = ?2",
+            params![playlist_id, song_id.as_str()],
+        )
+        .map_err(storage_error)?;
+        tx.execute(
+            "UPDATE playlist_items SET position = position - 1
+             WHERE playlist_id = ?1 AND position > ?2",
+            params![playlist_id, position],
+        )
+        .map_err(storage_error)?;
+        tx.execute(
+            "UPDATE playlists SET updated_at_ms = ?1 WHERE playlist_id = ?2",
+            params![now_ms, playlist_id],
+        )
+        .map_err(storage_error)?;
+        tx.commit().map_err(storage_error)
+    }
+
+    fn reorder_playlist_tracks(
+        &self,
+        playlist_id: &str,
+        song_ids: &[String],
+        now_ms: i64,
+    ) -> Result<Vec<PlaylistTrack>, StorageError> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction().map_err(storage_error)?;
+        let profile_id = active_profile_id(&tx)?;
+        ensure_playlist_exists(&tx, &profile_id, playlist_id)?;
+        let existing = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT song_id FROM playlist_items WHERE playlist_id = ?1 ORDER BY position",
+                )
+                .map_err(storage_error)?;
+            let rows = statement
+                .query_map([playlist_id], |row| row.get::<_, String>(0))
+                .map_err(storage_error)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(storage_error)?
+        };
+        let requested = song_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        if requested.len() != song_ids.len()
+            || existing.len() != song_ids.len()
+            || existing.iter().any(|id| !requested.contains(id))
+        {
+            return Err(StorageError(
+                "reorder must contain every playlist song exactly once".into(),
+            ));
+        }
+        // Move above the current range temporarily to avoid the unique position constraint.
+        let temporary_base = song_ids.len() as i64;
+        for (index, song_id) in song_ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE playlist_items SET position = ?1 WHERE playlist_id = ?2 AND song_id = ?3",
+                params![temporary_base + index as i64, playlist_id, song_id],
+            )
+            .map_err(storage_error)?;
+        }
+        for (index, song_id) in song_ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE playlist_items SET position = ?1 WHERE playlist_id = ?2 AND song_id = ?3",
+                params![index as i64, playlist_id, song_id],
+            )
+            .map_err(storage_error)?;
+        }
+        tx.execute(
+            "UPDATE playlists SET updated_at_ms = ?1 WHERE playlist_id = ?2",
+            params![now_ms, playlist_id],
+        )
+        .map_err(storage_error)?;
+        tx.commit().map_err(storage_error)?;
+        drop(connection);
+        self.playlist_tracks(playlist_id)
+    }
+
+    fn playlist_export_tracks(
+        &self,
+        playlist_id: &str,
+    ) -> Result<Vec<PlaylistExportTrack>, StorageError> {
+        let connection = self.connection()?;
+        let profile_id = active_profile_id(&connection)?;
+        ensure_playlist_exists(&connection, &profile_id, playlist_id)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT s.song_id, s.title, s.artist_id, s.artist_name, s.album_id,
+                        s.album_name, s.duration_ms, s.thumbnail_url,
+                        (SELECT lf.canonical_path FROM local_files lf
+                         WHERE lf.track_id = s.song_id
+                         ORDER BY lf.missing_since_ms IS NOT NULL, lf.local_file_id LIMIT 1),
+                        EXISTS(SELECT 1 FROM local_files lf
+                               WHERE lf.track_id = s.song_id AND lf.missing_since_ms IS NULL),
+                        EXISTS(SELECT 1 FROM jellyfin_track_sources jts
+                               WHERE jts.track_id = s.song_id)
+                 FROM playlist_items i
+                 JOIN playlists p ON p.playlist_id = i.playlist_id
+                 JOIN songs s ON s.song_id = i.song_id
+                 WHERE p.profile_id = ?1 AND p.playlist_id = ?2
+                 ORDER BY i.position",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(params![profile_id, playlist_id], |row| {
+                let song = song_from_row(row)?;
+                let local_path = row.get::<_, Option<String>>(8)?;
+                let indexed_local = row.get::<_, bool>(9)?;
+                let jellyfin = row.get::<_, bool>(10)?;
+                let source = if let Some(path) = local_path {
+                    let path = std::path::PathBuf::from(path);
+                    PlaylistItemSource::Local {
+                        available: indexed_local && path.is_file(),
+                        path,
+                    }
+                } else if jellyfin || song.id.as_str().starts_with("jellyfin:") {
+                    PlaylistItemSource::Jellyfin
+                } else if is_youtube_video_id(song.id.as_str()) {
+                    PlaylistItemSource::YouTube
+                } else {
+                    PlaylistItemSource::Unavailable
+                };
+                Ok(PlaylistExportTrack { song, source })
+            })
+            .map_err(storage_error)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage_error)
+    }
+
+    fn song_by_id(&self, song_id: &SongId) -> Result<Option<Song>, StorageError> {
+        self.connection()?
+            .query_row(
+                "SELECT song_id, title, artist_id, artist_name, album_id,
+                        album_name, duration_ms, thumbnail_url
+                 FROM songs WHERE song_id = ?1",
+                [song_id.as_str()],
+                song_from_row,
+            )
+            .optional()
+            .map_err(storage_error)
+    }
+
+    fn song_by_local_path(&self, path: &std::path::PathBuf) -> Result<Option<Song>, StorageError> {
+        let path = path
+            .to_str()
+            .ok_or_else(|| StorageError("local playlist path is not valid UTF-8".into()))?;
+        self.connection()?
+            .query_row(
+                "SELECT s.song_id, s.title, s.artist_id, s.artist_name, s.album_id,
+                        s.album_name, s.duration_ms, s.thumbnail_url
+                 FROM local_files lf JOIN songs s ON s.song_id = lf.track_id
+                 WHERE lf.canonical_path = ?1 AND lf.missing_since_ms IS NULL
+                 ORDER BY lf.local_file_id LIMIT 1",
+                [path],
+                song_from_row,
+            )
+            .optional()
+            .map_err(storage_error)
+    }
+
+    fn create_playlist_from_songs(
+        &self,
+        name: &str,
+        song_ids: &[SongId],
+        now_ms: i64,
+    ) -> Result<Playlist, StorageError> {
+        let name = validated_playlist_name(name)?;
+        let mut connection = self.connection()?;
+        let tx = connection.transaction().map_err(storage_error)?;
+        let profile_id = active_profile_id(&tx)?;
+        let playlist_id = new_uuid_v4(&tx)?;
+        tx.execute(
+            "INSERT INTO playlists
+             (playlist_id, profile_id, name, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![playlist_id, profile_id, name, now_ms],
+        )
+        .map_err(playlist_storage_error)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut position = 0_i64;
+        for song_id in song_ids {
+            if !seen.insert(song_id.as_str()) {
+                continue;
+            }
+            let inserted = tx
+                .execute(
+                    "INSERT INTO playlist_items (playlist_id, song_id, position, added_at_ms)
+                     SELECT ?1, song_id, ?3, ?4 FROM songs WHERE song_id = ?2",
+                    params![playlist_id, song_id.as_str(), position, now_ms],
+                )
+                .map_err(storage_error)?;
+            if inserted == 0 {
+                return Err(StorageError(format!(
+                    "cannot import unknown song {}",
+                    song_id.as_str()
+                )));
+            }
+            position += 1;
+        }
+        tx.commit().map_err(storage_error)?;
+        Ok(Playlist {
+            id: playlist_id,
+            name,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            track_count: position as u64,
+        })
+    }
+
+    fn create_backup(&self, destination: &std::path::PathBuf) -> Result<(), StorageError> {
+        let destination = destination
+            .to_str()
+            .ok_or_else(|| StorageError("backup path is not valid UTF-8".into()))?;
+        if std::path::Path::new(destination).exists() {
+            return Err(StorageError("backup staging file already exists".into()));
+        }
+        self.connection()?
+            .execute("VACUUM main INTO ?1", [destination])
+            .map_err(storage_error)?;
+        validate_restore_candidate(std::path::Path::new(destination))
+    }
+
     fn liked_song_ids(&self) -> Result<Vec<String>, StorageError> {
         let connection = self.connection()?;
         let profile_id = active_profile_id(&connection)?;
@@ -998,6 +1339,253 @@ impl MusicRepository for SqliteMusicRepository {
             .map_err(storage_error)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(storage_error)
+    }
+
+    fn liked_songs(&self, limit: usize, offset: usize) -> Result<Vec<Song>, StorageError> {
+        let connection = self.connection()?;
+        let profile_id = active_profile_id(&connection)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT s.song_id, s.title, s.artist_id, s.artist_name, s.album_id,
+                        s.album_name, s.duration_ms, s.thumbnail_url
+                 FROM track_stats t JOIN songs s ON s.song_id = t.song_id
+                 WHERE t.profile_id = ?1 AND t.liked = 1
+                 ORDER BY t.last_played_at_ms DESC, s.title COLLATE NOCASE, s.song_id
+                 LIMIT ?2 OFFSET ?3",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                params![profile_id, limit as i64, offset as i64],
+                song_from_row,
+            )
+            .map_err(storage_error)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage_error)
+    }
+
+    fn history_events(
+        &self,
+        limit: usize,
+        before: Option<i64>,
+    ) -> Result<Vec<HistoryEvent>, StorageError> {
+        let connection = self.connection()?;
+        let profile_id = active_profile_id(&connection)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT s.song_id, s.title, s.artist_id, s.artist_name, s.album_id,
+                        s.album_name, s.duration_ms, s.thumbnail_url,
+                        r.sequence_id, r.event_id, r.started_at_ms, r.listened_ms,
+                        r.duration_ms, r.end_reason
+                 FROM recent_plays r JOIN songs s ON s.song_id = r.song_id
+                 WHERE r.profile_id = ?1 AND (?3 IS NULL OR r.sequence_id < ?3)
+                 ORDER BY r.sequence_id DESC LIMIT ?2",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                params![profile_id, limit as i64, before],
+                history_event_from_row,
+            )
+            .map_err(storage_error)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage_error)
+    }
+
+    fn delete_history_event(&self, event_id: &str) -> Result<(), StorageError> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction().map_err(storage_error)?;
+        let profile_id = active_profile_id(&tx)?;
+        let changed = tx
+            .execute(
+                "DELETE FROM recent_plays WHERE profile_id = ?1 AND event_id = ?2",
+                params![profile_id, event_id],
+            )
+            .map_err(storage_error)?;
+        if changed == 0 {
+            return Err(StorageError("history event was not found".into()));
+        }
+        if profile_history_is_complete(&tx, &profile_id)? {
+            rebuild_profile_aggregates(&tx, &profile_id)?;
+        }
+        tx.commit().map_err(storage_error)
+    }
+
+    fn delete_song_history(&self, song_id: &SongId) -> Result<u64, StorageError> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction().map_err(storage_error)?;
+        let profile_id = active_profile_id(&tx)?;
+        let changed = tx
+            .execute(
+                "DELETE FROM recent_plays WHERE profile_id = ?1 AND song_id = ?2",
+                params![profile_id, song_id.as_str()],
+            )
+            .map_err(storage_error)?;
+        if profile_history_is_complete(&tx, &profile_id)? {
+            rebuild_profile_aggregates(&tx, &profile_id)?;
+        }
+        tx.commit().map_err(storage_error)?;
+        Ok(changed as u64)
+    }
+
+    fn clear_history(&self) -> Result<u64, StorageError> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction().map_err(storage_error)?;
+        let profile_id = active_profile_id(&tx)?;
+        let changed = tx
+            .execute(
+                "DELETE FROM recent_plays WHERE profile_id = ?1",
+                [&profile_id],
+            )
+            .map_err(storage_error)?;
+        if profile_history_is_complete(&tx, &profile_id)? {
+            rebuild_profile_aggregates(&tx, &profile_id)?;
+        }
+        tx.commit().map_err(storage_error)?;
+        Ok(changed as u64)
+    }
+
+    fn listening_recap(
+        &self,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<ListeningRecap, StorageError> {
+        if from_ms.zip(to_ms).is_some_and(|(from, to)| from >= to) {
+            return Err(StorageError("recap date range must have from < to".into()));
+        }
+        let connection = self.connection()?;
+        let profile_id = active_profile_id(&connection)?;
+        recap_from_connection(&connection, &profile_id, from_ms, to_ms, limit)
+    }
+
+    fn local_text_suggestions(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        if query.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "WITH suggestions(value, priority) AS (
+                    SELECT title, 0 FROM songs WHERE title LIKE ?1 || '%' COLLATE NOCASE
+                    UNION SELECT artist_name, 1 FROM songs WHERE artist_name LIKE ?1 || '%' COLLATE NOCASE
+                    UNION SELECT album_name, 2 FROM songs
+                        WHERE album_name IS NOT NULL AND album_name LIKE ?1 || '%' COLLATE NOCASE
+                 ) SELECT value FROM suggestions WHERE trim(value) <> ''
+                   ORDER BY priority, value COLLATE NOCASE LIMIT ?2",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(params![query.trim(), limit as i64], |row| row.get(0))
+            .map_err(storage_error)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage_error)
+    }
+
+    fn create_download_attempt(
+        &self,
+        song: &Song,
+        created_at_ms: i64,
+    ) -> Result<DownloadRecord, StorageError> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction().map_err(storage_error)?;
+        upsert_song(&tx, song)?;
+        let profile_id = active_profile_id(&tx)?;
+        let record = DownloadRecord {
+            id: uuid::Uuid::now_v7().to_string(),
+            song: song.clone(),
+            status: "pending".into(),
+            location: None,
+            file_name: None,
+            error: None,
+            created_at_ms,
+            completed_at_ms: None,
+        };
+        tx.execute(
+            "INSERT INTO downloads (download_id, profile_id, song_id, status, created_at_ms)
+             VALUES (?1, ?2, ?3, 'pending', ?4)",
+            params![record.id, profile_id, song.id.as_str(), created_at_ms],
+        )
+        .map_err(storage_error)?;
+        tx.commit().map_err(storage_error)?;
+        Ok(record)
+    }
+
+    fn finish_download_attempt(
+        &self,
+        download_id: &str,
+        status: &str,
+        location: Option<&str>,
+        file_name: Option<&str>,
+        error: Option<&str>,
+        completed_at_ms: i64,
+    ) -> Result<(), StorageError> {
+        if !matches!(status, "completed" | "failed") {
+            return Err(StorageError("invalid final download status".into()));
+        }
+        let connection = self.connection()?;
+        let changed = connection
+            .execute(
+                "UPDATE downloads SET status = ?1, location = ?2, file_name = ?3,
+                        error = ?4, completed_at_ms = ?5
+                 WHERE download_id = ?6",
+                params![
+                    status,
+                    location,
+                    file_name,
+                    error,
+                    completed_at_ms,
+                    download_id
+                ],
+            )
+            .map_err(storage_error)?;
+        if changed == 0 {
+            return Err(StorageError("download attempt was not found".into()));
+        }
+        Ok(())
+    }
+
+    fn downloads(&self, limit: usize, offset: usize) -> Result<Vec<DownloadRecord>, StorageError> {
+        let connection = self.connection()?;
+        let profile_id = active_profile_id(&connection)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT s.song_id, s.title, s.artist_id, s.artist_name, s.album_id,
+                        s.album_name, s.duration_ms, s.thumbnail_url,
+                        d.download_id, d.status, d.location, d.file_name, d.error,
+                        d.created_at_ms, d.completed_at_ms
+                 FROM downloads d JOIN songs s ON s.song_id = d.song_id
+                 WHERE d.profile_id = ?1 ORDER BY d.created_at_ms DESC, d.download_id
+                 LIMIT ?2 OFFSET ?3",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                params![profile_id, limit as i64, offset as i64],
+                download_from_row,
+            )
+            .map_err(storage_error)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage_error)
+    }
+
+    fn remove_download(&self, download_id: &str) -> Result<(), StorageError> {
+        let connection = self.connection()?;
+        let profile_id = active_profile_id(&connection)?;
+        let changed = connection
+            .execute(
+                "DELETE FROM downloads WHERE download_id = ?1 AND profile_id = ?2",
+                params![download_id, profile_id],
+            )
+            .map_err(storage_error)?;
+        if changed == 0 {
+            return Err(StorageError("download attempt was not found".into()));
+        }
+        Ok(())
     }
 
     fn artist_affinities(&self) -> Result<std::collections::HashMap<String, f64>, StorageError> {
@@ -1098,6 +1686,104 @@ impl MusicRepository for SqliteMusicRepository {
         Ok(())
     }
 
+    fn local_scan_state(&self, directory_id: i64) -> Result<Vec<ScannedLocalTrack>, StorageError> {
+        let connection = self.connection()?;
+        let mut tracks = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT s.song_id, s.title, s.artist_id, s.artist_name, s.album_id,
+                            s.album_name, s.duration_ms, s.thumbnail_url,
+                            lf.local_file_id, lf.canonical_path, lf.relative_path, lf.mime_type,
+                            lf.file_size_bytes, lf.modified_at_ms, lf.source_identity,
+                            lf.first_seen_at_ms, lf.replay_gain_track_db, lf.replay_gain_album_db,
+                            lf.replay_gain_track_peak, lf.replay_gain_album_peak,
+                            lf.modified_at_ns, lf.sidecar_artwork_path,
+                            lf.sidecar_artwork_size_bytes, lf.sidecar_artwork_modified_at_ns
+                     FROM local_files lf JOIN songs s ON s.song_id = lf.track_id
+                     WHERE lf.directory_id = ?1 ORDER BY lf.local_file_id",
+                )
+                .map_err(storage_error)?;
+            let rows = statement
+                .query_map([directory_id], |row| {
+                    let gain = solmusic_domain::NormalizationGainMetadata {
+                        track_gain_db: row.get(16)?,
+                        album_gain_db: row.get(17)?,
+                        track_peak: row.get(18)?,
+                        album_peak: row.get(19)?,
+                    };
+                    Ok(ScannedLocalTrack {
+                        local_file_id: Some(row.get(8)?),
+                        song: song_from_row(row)?,
+                        canonical_path: row.get(9)?,
+                        relative_path: row.get(10)?,
+                        mime_type: row.get(11)?,
+                        file_size_bytes: nonnegative_u64(row, 12)?,
+                        modified_at_ms: row.get(13)?,
+                        modified_at_ns: row.get(20)?,
+                        source_identity: row.get(14)?,
+                        sidecar_artwork_path: row.get(21)?,
+                        sidecar_artwork_size_bytes: row.get(22)?,
+                        sidecar_artwork_modified_at_ns: row.get(23)?,
+                        normalization_gain_metadata: (gain
+                            != solmusic_domain::NormalizationGainMetadata::default())
+                        .then_some(gain),
+                        artist_names: Vec::new(),
+                        first_seen_at_ms: row.get(15)?,
+                        metadata_changed: false,
+                    })
+                })
+                .map_err(storage_error)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(storage_error)?
+        };
+        let mut artists = HashMap::<String, Vec<String>>::new();
+        {
+            let mut statement = connection
+                .prepare(
+                    "SELECT DISTINCT lf.track_id, la.display_name, lta.credit_order
+                     FROM local_files lf
+                     JOIN local_track_artists lta ON lta.track_id = lf.track_id
+                     JOIN local_artists la ON la.artist_id = lta.artist_id
+                     WHERE lf.directory_id = ?1
+                     ORDER BY lf.track_id, lta.credit_order",
+                )
+                .map_err(storage_error)?;
+            let rows = statement
+                .query_map([directory_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(storage_error)?;
+            for row in rows {
+                let (track_id, artist) = row.map_err(storage_error)?;
+                artists.entry(track_id).or_default().push(artist);
+            }
+        }
+        for track in &mut tracks {
+            track.artist_names = artists
+                .get(track.song.id.as_str())
+                .cloned()
+                .unwrap_or_else(|| vec![track.song.artist.name.clone()]);
+        }
+        Ok(tracks)
+    }
+
+    fn referenced_local_artwork(&self) -> Result<Vec<String>, StorageError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT DISTINCT s.thumbnail_url
+                 FROM songs s JOIN local_files lf ON lf.track_id = s.song_id
+                 WHERE lf.missing_since_ms IS NULL
+                   AND s.thumbnail_url LIKE 'local-artwork:%'",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([], |row| row.get(0))
+            .map_err(storage_error)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage_error)
+    }
+
     fn replace_directory_scan(
         &self,
         directory_id: i64,
@@ -1126,10 +1812,36 @@ impl MusicRepository for SqliteMusicRepository {
             )
             .map_err(storage_error)?;
         }
+        // Explicit persisted row IDs make renames unambiguous. Stage their unique paths
+        // first so swaps and rename chains cannot collide with one another mid-transaction.
+        let observed_local_file_ids = tracks
+            .iter()
+            .filter_map(|track| track.local_file_id)
+            .collect::<HashSet<_>>();
+        for local_file_id in &observed_local_file_ids {
+            tx.execute(
+                "UPDATE local_files
+                 SET canonical_path = 'solmusic-scan-staging:' || directory_id || ':' || local_file_id,
+                     relative_path = 'solmusic-scan-staging:' || local_file_id
+                 WHERE local_file_id = ?1 AND directory_id = ?2",
+                params![local_file_id, directory_id],
+            )
+            .map_err(storage_error)?;
+        }
 
         for track in tracks {
-            let path_match = tx
-                .query_row(
+            let explicit_match = track.local_file_id.map_or(Ok(None), |local_file_id| {
+                tx.query_row(
+                    "SELECT local_file_id, track_id, first_seen_at_ms FROM local_files
+                     WHERE local_file_id = ?1 AND directory_id = ?2",
+                    params![local_file_id, directory_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(storage_error)
+            })?;
+            let path_match = if explicit_match.is_none() {
+                tx.query_row(
                     "SELECT local_file_id, track_id, first_seen_at_ms FROM local_files
                      WHERE canonical_path = ?1",
                     [&track.canonical_path],
@@ -1142,36 +1854,50 @@ impl MusicRepository for SqliteMusicRepository {
                     },
                 )
                 .optional()
-                .map_err(storage_error)?;
-            let identity_match = if path_match.is_none() {
-                track
-                    .source_identity
-                    .as_deref()
-                    .map_or(Ok(None), |identity| {
-                        tx.query_row(
-                            "SELECT local_file_id, track_id, first_seen_at_ms FROM local_files
-                         WHERE source_identity = ?1 ORDER BY local_file_id LIMIT 1",
-                            [identity],
-                            |row| {
-                                Ok((
-                                    row.get::<_, i64>(0)?,
-                                    row.get::<_, String>(1)?,
-                                    row.get::<_, i64>(2)?,
-                                ))
-                            },
-                        )
-                        .optional()
-                        .map_err(storage_error)
-                    })?
+                .map_err(storage_error)?
             } else {
                 None
             };
-            let fingerprint_match = if path_match.is_none() && identity_match.is_none() {
+            let identity_match = if explicit_match.is_none() && path_match.is_none() {
+                if let Some(identity) = track.source_identity.as_deref() {
+                    let mut statement = tx
+                        .prepare(
+                            "SELECT local_file_id, track_id, first_seen_at_ms FROM local_files
+                             WHERE source_identity = ?1 ORDER BY local_file_id",
+                        )
+                        .map_err(storage_error)?;
+                    let matches = statement
+                        .query_map([identity], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        })
+                        .map_err(storage_error)?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map_err(storage_error)?
+                        .into_iter()
+                        .filter(|(local_file_id, _, _)| {
+                            !observed_local_file_ids.contains(local_file_id)
+                        })
+                        .collect::<Vec<_>>();
+                    (matches.len() == 1).then(|| matches[0].clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let fingerprint_match = if explicit_match.is_none()
+                && path_match.is_none()
+                && identity_match.is_none()
+            {
                 let mut statement = tx
                     .prepare(
                         "SELECT local_file_id, track_id, first_seen_at_ms FROM local_files
                          WHERE track_id = ?1 AND canonical_path <> ?2 AND missing_since_ms IS NOT NULL
-                         ORDER BY local_file_id LIMIT 2",
+                         ORDER BY local_file_id",
                     )
                     .map_err(storage_error)?;
                 let matches = statement
@@ -1187,12 +1913,20 @@ impl MusicRepository for SqliteMusicRepository {
                     )
                     .map_err(storage_error)?
                     .collect::<rusqlite::Result<Vec<_>>>()
-                    .map_err(storage_error)?;
+                    .map_err(storage_error)?
+                    .into_iter()
+                    .filter(|(local_file_id, _, _)| {
+                        !observed_local_file_ids.contains(local_file_id)
+                    })
+                    .collect::<Vec<_>>();
                 (matches.len() == 1).then(|| matches[0].clone())
             } else {
                 None
             };
-            let matched = path_match.or(identity_match).or(fingerprint_match);
+            let matched = explicit_match
+                .or(path_match)
+                .or(identity_match)
+                .or(fingerprint_match);
             let canonical_track_id = matched
                 .as_ref()
                 .map(|(_, track_id, _)| track_id.as_str())
@@ -1200,14 +1934,21 @@ impl MusicRepository for SqliteMusicRepository {
             let mut canonical_song = track.song.clone();
             canonical_song.id = SongId::new(canonical_track_id.to_owned())
                 .expect("stored and generated track IDs are nonblank");
-            upsert_song(&tx, &canonical_song)?;
+            if track.metadata_changed {
+                upsert_local_song(&tx, &canonical_song)?;
+            }
 
             if let Some((local_file_id, _, first_seen_at_ms)) = matched {
                 tx.execute(
                     "UPDATE local_files SET directory_id = ?2, canonical_path = ?3,
                          relative_path = ?4, track_id = ?5, mime_type = ?6,
                          file_size_bytes = ?7, modified_at_ms = ?8, source_identity = ?9,
-                         first_seen_at_ms = ?10, missing_since_ms = NULL
+                         first_seen_at_ms = ?10, missing_since_ms = NULL,
+                         replay_gain_track_db = ?11, replay_gain_album_db = ?12,
+                         replay_gain_track_peak = ?13, replay_gain_album_peak = ?14,
+                         modified_at_ns = ?15, sidecar_artwork_path = ?16,
+                         sidecar_artwork_size_bytes = ?17,
+                         sidecar_artwork_modified_at_ns = ?18
                      WHERE local_file_id = ?1",
                     params![
                         local_file_id,
@@ -1220,6 +1961,25 @@ impl MusicRepository for SqliteMusicRepository {
                         track.modified_at_ms,
                         track.source_identity,
                         first_seen_at_ms,
+                        track
+                            .normalization_gain_metadata
+                            .and_then(|value| value.track_gain_db),
+                        track
+                            .normalization_gain_metadata
+                            .and_then(|value| value.album_gain_db),
+                        track
+                            .normalization_gain_metadata
+                            .and_then(|value| value.track_peak),
+                        track
+                            .normalization_gain_metadata
+                            .and_then(|value| value.album_peak),
+                        track.modified_at_ns,
+                        track.sidecar_artwork_path,
+                        track
+                            .sidecar_artwork_size_bytes
+                            .map(|size| sqlite_integer(size, "sidecar artwork size"))
+                            .transpose()?,
+                        track.sidecar_artwork_modified_at_ns,
                     ],
                 )
                 .map_err(storage_error)?;
@@ -1227,8 +1987,12 @@ impl MusicRepository for SqliteMusicRepository {
                 tx.execute(
                     "INSERT INTO local_files
                      (directory_id, canonical_path, relative_path, track_id, mime_type,
-                      file_size_bytes, modified_at_ms, source_identity, first_seen_at_ms, missing_since_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+                      file_size_bytes, modified_at_ms, source_identity, first_seen_at_ms, missing_since_ms,
+                      replay_gain_track_db, replay_gain_album_db, replay_gain_track_peak, replay_gain_album_peak,
+                      modified_at_ns, sidecar_artwork_path, sidecar_artwork_size_bytes,
+                      sidecar_artwork_modified_at_ns)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?12, ?13,
+                             ?14, ?15, ?16, ?17)",
                     params![
                         directory_id,
                         track.canonical_path,
@@ -1239,39 +2003,52 @@ impl MusicRepository for SqliteMusicRepository {
                         track.modified_at_ms,
                         track.source_identity,
                         track.first_seen_at_ms,
+                        track.normalization_gain_metadata.and_then(|value| value.track_gain_db),
+                        track.normalization_gain_metadata.and_then(|value| value.album_gain_db),
+                        track.normalization_gain_metadata.and_then(|value| value.track_peak),
+                        track.normalization_gain_metadata.and_then(|value| value.album_peak),
+                        track.modified_at_ns,
+                        track.sidecar_artwork_path,
+                        track
+                            .sidecar_artwork_size_bytes
+                            .map(|size| sqlite_integer(size, "sidecar artwork size"))
+                            .transpose()?,
+                        track.sidecar_artwork_modified_at_ns,
                     ],
                 )
                 .map_err(storage_error)?;
             }
 
-            tx.execute(
-                "DELETE FROM local_track_artists WHERE track_id = ?1",
-                [canonical_track_id],
-            )
-            .map_err(storage_error)?;
-            for (order, name) in track.artist_names.iter().enumerate() {
-                let display_name = normalized_artist_display(name);
-                let normalized_name = display_name.to_lowercase();
+            if track.metadata_changed {
                 tx.execute(
-                    "INSERT INTO local_artists (normalized_name, display_name, enabled)
-                     VALUES (?1, ?2, 1)
-                     ON CONFLICT(normalized_name) DO UPDATE SET display_name = excluded.display_name",
-                    params![normalized_name, display_name],
+                    "DELETE FROM local_track_artists WHERE track_id = ?1",
+                    [canonical_track_id],
                 )
                 .map_err(storage_error)?;
-                let artist_id: i64 = tx
-                    .query_row(
-                        "SELECT artist_id FROM local_artists WHERE normalized_name = ?1",
-                        [normalized_name],
-                        |row| row.get(0),
+                for (order, name) in track.artist_names.iter().enumerate() {
+                    let display_name = normalized_artist_display(name);
+                    let normalized_name = display_name.to_lowercase();
+                    tx.execute(
+                        "INSERT INTO local_artists (normalized_name, display_name, enabled)
+                         VALUES (?1, ?2, 1)
+                         ON CONFLICT(normalized_name) DO UPDATE SET display_name = excluded.display_name",
+                        params![normalized_name, display_name],
                     )
                     .map_err(storage_error)?;
-                tx.execute(
-                    "INSERT OR IGNORE INTO local_track_artists (track_id, artist_id, credit_order)
-                     VALUES (?1, ?2, ?3)",
-                    params![canonical_track_id, artist_id, order as i64],
-                )
-                .map_err(storage_error)?;
+                    let artist_id: i64 = tx
+                        .query_row(
+                            "SELECT artist_id FROM local_artists WHERE normalized_name = ?1",
+                            [normalized_name],
+                            |row| row.get(0),
+                        )
+                        .map_err(storage_error)?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO local_track_artists (track_id, artist_id, credit_order)
+                         VALUES (?1, ?2, ?3)",
+                        params![canonical_track_id, artist_id, order as i64],
+                    )
+                    .map_err(storage_error)?;
+                }
             }
         }
 
@@ -1313,7 +2090,11 @@ impl MusicRepository for SqliteMusicRepository {
         Ok(LibraryScanResult {
             directory_id,
             status: status.into(),
-            indexed_tracks: tracks.len(),
+            indexed_tracks: tracks.iter().filter(|track| track.metadata_changed).count(),
+            unchanged_tracks: tracks
+                .iter()
+                .filter(|track| !track.metadata_changed)
+                .count(),
             unavailable_tracks,
             skipped_files,
             duration_ms,
@@ -1340,6 +2121,39 @@ impl MusicRepository for SqliteMusicRepository {
             return Err(StorageError("music directory was not found".into()));
         }
         Ok(())
+    }
+
+    fn mark_local_file_missing(
+        &self,
+        canonical_path: &str,
+        missing_since_ms: i64,
+    ) -> Result<(), StorageError> {
+        let mut connection = self.connection()?;
+        let tx = connection.transaction().map_err(storage_error)?;
+        let directory_id = tx
+            .query_row(
+                "SELECT directory_id FROM local_files WHERE canonical_path = ?1",
+                [canonical_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        if let Some(directory_id) = directory_id {
+            tx.execute(
+                "UPDATE local_files SET missing_since_ms = ?2 WHERE canonical_path = ?1",
+                params![canonical_path, missing_since_ms],
+            )
+            .map_err(storage_error)?;
+            tx.execute(
+                "UPDATE music_directories SET track_count = (
+                     SELECT COUNT(*) FROM local_files
+                     WHERE directory_id = ?1 AND missing_since_ms IS NULL
+                 ) WHERE directory_id = ?1",
+                [directory_id],
+            )
+            .map_err(storage_error)?;
+        }
+        tx.commit().map_err(storage_error)
     }
 
     fn local_artists(
@@ -1669,7 +2483,8 @@ impl MusicRepository for SqliteMusicRepository {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(
-                "SELECT canonical_path, mime_type FROM local_files
+                "SELECT canonical_path, mime_type, replay_gain_track_db, replay_gain_album_db,
+                        replay_gain_track_peak, replay_gain_album_peak FROM local_files
                  WHERE track_id = ?1 AND missing_since_ms IS NULL
                  ORDER BY local_file_id",
             )
@@ -1679,6 +2494,16 @@ impl MusicRepository for SqliteMusicRepository {
                 Ok(LocalPlaybackFile {
                     path: std::path::PathBuf::from(row.get::<_, String>(0)?),
                     mime_type: row.get(1)?,
+                    normalization_gain_metadata: {
+                        let metadata = solmusic_domain::NormalizationGainMetadata {
+                            track_gain_db: row.get(2)?,
+                            album_gain_db: row.get(3)?,
+                            track_peak: row.get(4)?,
+                            album_peak: row.get(5)?,
+                        };
+                        (metadata != solmusic_domain::NormalizationGainMetadata::default())
+                            .then_some(metadata)
+                    },
                 })
             })
             .map_err(storage_error)?;
@@ -1745,6 +2570,13 @@ impl MusicRepository for SqliteMusicRepository {
             query_duration_ms: started.elapsed().as_millis() as u64,
         })
     }
+}
+
+fn is_youtube_video_id(value: &str) -> bool {
+    value.len() == 11
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 fn artist_key(song: &Song) -> String {
@@ -1890,6 +2722,282 @@ fn playlist_track_from_row(row: &Row<'_>) -> rusqlite::Result<PlaylistTrack> {
     })
 }
 
+fn history_event_from_row(row: &Row<'_>) -> rusqlite::Result<HistoryEvent> {
+    Ok(HistoryEvent {
+        song: song_from_row(row)?,
+        sequence_id: row.get(8)?,
+        event_id: row.get(9)?,
+        started_at_ms: row.get(10)?,
+        listened_ms: nonnegative_u64(row, 11)?,
+        duration_ms: optional_u64(row, 12)?,
+        reason: row.get(13)?,
+    })
+}
+
+fn download_from_row(row: &Row<'_>) -> rusqlite::Result<DownloadRecord> {
+    Ok(DownloadRecord {
+        song: song_from_row(row)?,
+        id: row.get(8)?,
+        status: row.get(9)?,
+        location: row.get(10)?,
+        file_name: row.get(11)?,
+        error: row.get(12)?,
+        created_at_ms: row.get(13)?,
+        completed_at_ms: row.get(14)?,
+    })
+}
+
+fn profile_history_is_complete(
+    connection: &Connection,
+    profile_id: &str,
+) -> Result<bool, StorageError> {
+    connection
+        .query_row(
+            "SELECT legacy_incomplete = 0 FROM history_coverage WHERE profile_id = ?1",
+            [profile_id],
+            |row| row.get(0),
+        )
+        .map_err(storage_error)
+}
+
+fn rebuild_profile_aggregates(tx: &Transaction<'_>, profile_id: &str) -> Result<(), StorageError> {
+    // Reactions survive history deletion. Playback-derived fields are rebuilt from the
+    // retained event log so recommendations never retain signals from deleted events.
+    tx.execute(
+        "UPDATE track_stats SET play_count = 0, completed_count = 0, early_skip_count = 0,
+                completion_ema = 0.0, completion_samples = 0,
+                affinity = CASE WHEN liked = 1 THEN ?2 WHEN disliked = 1 THEN ?3 ELSE 0.0 END,
+                last_played_at_ms = NULL
+         WHERE profile_id = ?1",
+        params![profile_id, LIKE_AFFINITY, DISLIKE_AFFINITY],
+    )
+    .map_err(storage_error)?;
+    tx.execute(
+        "UPDATE track_stats AS t SET
+            play_count = (SELECT COUNT(*) FROM recent_plays r WHERE r.profile_id = t.profile_id
+                          AND r.song_id = t.song_id AND (r.listened_ms >= 30000 OR
+                          (r.duration_ms > 0 AND 1.0 * r.listened_ms / r.duration_ms >= 0.2))),
+            completed_count = (SELECT COUNT(*) FROM recent_plays r WHERE r.profile_id = t.profile_id
+                          AND r.song_id = t.song_id AND (r.end_reason = 'Completed' OR
+                          (r.duration_ms > 0 AND 1.0 * r.listened_ms / r.duration_ms >= 0.8))),
+            early_skip_count = (SELECT COUNT(*) FROM recent_plays r WHERE r.profile_id = t.profile_id
+                          AND r.song_id = t.song_id AND r.end_reason IN ('Next', 'Previous')
+                          AND r.listened_ms < 20000),
+            completion_ema = COALESCE((SELECT AVG(MIN(1.0, 1.0 * r.listened_ms / r.duration_ms))
+                          FROM recent_plays r WHERE r.profile_id = t.profile_id
+                          AND r.song_id = t.song_id AND r.duration_ms > 0), 0.0),
+            completion_samples = (SELECT COUNT(*) FROM recent_plays r WHERE r.profile_id = t.profile_id
+                          AND r.song_id = t.song_id AND r.duration_ms > 0),
+            affinity = affinity + COALESCE((SELECT SUM(
+                          (r.listened_ms >= 30000 OR (r.duration_ms > 0 AND 1.0 * r.listened_ms / r.duration_ms >= 0.2)) +
+                          (r.end_reason = 'Completed' OR (r.duration_ms > 0 AND 1.0 * r.listened_ms / r.duration_ms >= 0.8)) -
+                          (r.end_reason IN ('Next', 'Previous') AND r.listened_ms < 20000))
+                          FROM recent_plays r WHERE r.profile_id = t.profile_id AND r.song_id = t.song_id), 0),
+            last_played_at_ms = (SELECT MAX(r.started_at_ms) FROM recent_plays r
+                          WHERE r.profile_id = t.profile_id AND r.song_id = t.song_id)
+         WHERE t.profile_id = ?1",
+        [profile_id],
+    )
+    .map_err(storage_error)?;
+    // Restore the same chronological EMA semantics used by record_playback rather
+    // than leaving the simpler SQL average above as the final value.
+    let completion_emas = {
+        let mut statement = tx
+            .prepare(
+                "SELECT song_id, MIN(1.0, 1.0 * listened_ms / duration_ms)
+                 FROM recent_plays
+                 WHERE profile_id = ?1 AND duration_ms > 0
+                 ORDER BY started_at_ms, sequence_id",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([profile_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })
+            .map_err(storage_error)?;
+        let mut values = std::collections::HashMap::<String, (f64, u64)>::new();
+        for row in rows {
+            let (song_id, completion) = row.map_err(storage_error)?;
+            let entry = values.entry(song_id).or_insert((completion, 0));
+            if entry.1 > 0 {
+                entry.0 =
+                    entry.0 * (1.0 - COMPLETION_EMA_ALPHA) + completion * COMPLETION_EMA_ALPHA;
+            }
+            entry.1 += 1;
+        }
+        values
+    };
+    for (song_id, (ema, samples)) in completion_emas {
+        tx.execute(
+            "UPDATE track_stats SET completion_ema = ?1, completion_samples = ?2
+             WHERE profile_id = ?3 AND song_id = ?4",
+            params![ema, samples as i64, profile_id, song_id],
+        )
+        .map_err(storage_error)?;
+    }
+    tx.execute(
+        "DELETE FROM profile_artist_stats WHERE profile_id = ?1",
+        [profile_id],
+    )
+    .map_err(storage_error)?;
+    tx.execute(
+        "INSERT INTO profile_artist_stats
+         (profile_id, artist_key, artist_name, play_count, completed_count, early_skip_count,
+          completion_ema, completion_samples, affinity, last_played_at_ms)
+         SELECT t.profile_id, COALESCE(s.artist_id, 'name:' || lower(trim(s.artist_name))),
+                MAX(s.artist_name), SUM(t.play_count), SUM(t.completed_count),
+                SUM(t.early_skip_count), 0.0, SUM(t.completion_samples),
+                SUM(t.affinity - CASE WHEN t.liked = 1 THEN ?2 WHEN t.disliked = 1 THEN ?3 ELSE 0 END
+                    + CASE WHEN t.liked = 1 THEN ?2 * ?4 WHEN t.disliked = 1 THEN ?3 * ?4 ELSE 0 END),
+                MAX(t.last_played_at_ms)
+         FROM track_stats t JOIN songs s ON s.song_id = t.song_id
+         WHERE t.profile_id = ?1
+         GROUP BY t.profile_id, COALESCE(s.artist_id, 'name:' || lower(trim(s.artist_name)))",
+        params![profile_id, LIKE_AFFINITY, DISLIKE_AFFINITY, ARTIST_REACTION_WEIGHT],
+    )
+    .map_err(storage_error)?;
+
+    let artist_completion_emas = {
+        let mut statement = tx
+            .prepare(
+                "SELECT COALESCE(s.artist_id, 'name:' || lower(trim(s.artist_name))),
+                        MIN(1.0, 1.0 * r.listened_ms / r.duration_ms)
+                 FROM recent_plays r JOIN songs s ON s.song_id = r.song_id
+                 WHERE r.profile_id = ?1 AND r.duration_ms > 0
+                 ORDER BY r.started_at_ms, r.sequence_id",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([profile_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })
+            .map_err(storage_error)?;
+        let mut values = std::collections::HashMap::<String, (f64, u64)>::new();
+        for row in rows {
+            let (artist_key, completion) = row.map_err(storage_error)?;
+            let entry = values.entry(artist_key).or_insert((completion, 0));
+            if entry.1 > 0 {
+                entry.0 =
+                    entry.0 * (1.0 - COMPLETION_EMA_ALPHA) + completion * COMPLETION_EMA_ALPHA;
+            }
+            entry.1 += 1;
+        }
+        values
+    };
+    for (artist_key, (ema, samples)) in artist_completion_emas {
+        tx.execute(
+            "UPDATE profile_artist_stats SET completion_ema = ?1, completion_samples = ?2
+             WHERE profile_id = ?3 AND artist_key = ?4",
+            params![ema, samples as i64, profile_id, artist_key],
+        )
+        .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+fn recap_from_connection(
+    connection: &Connection,
+    profile_id: &str,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+    limit: usize,
+) -> Result<ListeningRecap, StorageError> {
+    let filter = "r.profile_id = ?1 AND (?2 IS NULL OR r.started_at_ms >= ?2) AND (?3 IS NULL OR r.started_at_ms < ?3)";
+    let (total_listened_ms, plays, completions, skips, unique_songs, unique_artists): (i64, i64, i64, i64, i64, i64) = connection
+        .query_row(
+            &format!("SELECT COALESCE(SUM(r.listened_ms), 0), COUNT(*),
+                COALESCE(SUM(r.end_reason = 'Completed' OR (r.duration_ms > 0 AND 1.0 * r.listened_ms / r.duration_ms >= 0.8)), 0),
+                COALESCE(SUM(r.end_reason IN ('Next', 'Previous') AND r.listened_ms < 20000), 0),
+                COUNT(DISTINCT r.song_id),
+                COUNT(DISTINCT COALESCE(s.artist_id, 'name:' || lower(trim(s.artist_name))))
+             FROM recent_plays r JOIN songs s ON s.song_id = r.song_id WHERE {filter}"),
+            params![profile_id, from_ms, to_ms],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )
+        .map_err(storage_error)?;
+    let top_songs = {
+        let mut statement = connection.prepare(&format!(
+            "SELECT s.song_id, s.title, s.artist_id, s.artist_name, s.album_id, s.album_name,
+                    s.duration_ms, s.thumbnail_url, SUM(r.listened_ms), COUNT(*),
+                    SUM(r.end_reason = 'Completed' OR (r.duration_ms > 0 AND 1.0 * r.listened_ms / r.duration_ms >= 0.8)),
+                    SUM(r.end_reason IN ('Next', 'Previous') AND r.listened_ms < 20000)
+             FROM recent_plays r JOIN songs s ON s.song_id = r.song_id WHERE {filter}
+             GROUP BY r.song_id ORDER BY SUM(r.listened_ms) DESC, COUNT(*) DESC LIMIT ?4"
+        )).map_err(storage_error)?;
+        let rows = statement
+            .query_map(params![profile_id, from_ms, to_ms, limit as i64], |row| {
+                Ok(RecapSong {
+                    song: song_from_row(row)?,
+                    listened_ms: nonnegative_u64(row, 8)?,
+                    plays: nonnegative_u64(row, 9)?,
+                    completions: nonnegative_u64(row, 10)?,
+                    skips: nonnegative_u64(row, 11)?,
+                })
+            })
+            .map_err(storage_error)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage_error)?
+    };
+    let top_artists = {
+        let mut statement = connection.prepare(&format!(
+            "SELECT s.artist_id, s.artist_name, SUM(r.listened_ms), COUNT(*),
+                    SUM(r.end_reason = 'Completed' OR (r.duration_ms > 0 AND 1.0 * r.listened_ms / r.duration_ms >= 0.8)),
+                    SUM(r.end_reason IN ('Next', 'Previous') AND r.listened_ms < 20000)
+             FROM recent_plays r JOIN songs s ON s.song_id = r.song_id WHERE {filter}
+             GROUP BY COALESCE(s.artist_id, 'name:' || lower(trim(s.artist_name)))
+             ORDER BY SUM(r.listened_ms) DESC, COUNT(*) DESC LIMIT ?4"
+        )).map_err(storage_error)?;
+        let rows = statement
+            .query_map(params![profile_id, from_ms, to_ms, limit as i64], |row| {
+                Ok(RecapArtist {
+                    artist_id: row.get(0)?,
+                    artist_name: row.get(1)?,
+                    listened_ms: nonnegative_u64(row, 2)?,
+                    plays: nonnegative_u64(row, 3)?,
+                    completions: nonnegative_u64(row, 4)?,
+                    skips: nonnegative_u64(row, 5)?,
+                })
+            })
+            .map_err(storage_error)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(storage_error)?
+    };
+    let (complete_from_ms, legacy_incomplete): (i64, bool) = connection.query_row(
+        "SELECT complete_from_ms, legacy_incomplete FROM history_coverage WHERE profile_id = ?1",
+        [profile_id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(storage_error)?;
+    let available_from_ms = connection
+        .query_row(
+            "SELECT MIN(started_at_ms) FROM recent_plays WHERE profile_id = ?1",
+            [profile_id],
+            |row| row.get(0),
+        )
+        .map_err(storage_error)?;
+    let complete = !legacy_incomplete || from_ms.is_some_and(|from| from >= complete_from_ms);
+    Ok(ListeningRecap {
+        total_listened_ms: total_listened_ms.max(0) as u64,
+        plays: plays.max(0) as u64,
+        completions: completions.max(0) as u64,
+        skips: skips.max(0) as u64,
+        unique_songs: unique_songs.max(0) as u64,
+        unique_artists: unique_artists.max(0) as u64,
+        top_songs,
+        top_artists,
+        coverage: RecapCoverage {
+            requested_from_ms: from_ms,
+            requested_to_ms: to_ms,
+            available_from_ms,
+            complete_from_ms,
+            complete,
+            note: if complete {
+                "Complete for the requested range".into()
+            } else {
+                format!("Events before {complete_from_ms} may be incomplete because earlier releases retained only the newest {MAX_RECENT_PLAYS} events per profile")
+            },
+        },
+    })
+}
+
 fn repair_active_profile(connection: &mut Connection) -> Result<(), StorageError> {
     let tx = connection.transaction().map_err(storage_error)?;
     let profile_count: i64 = tx
@@ -1937,6 +3045,41 @@ fn repair_active_profile(connection: &mut Connection) -> Result<(), StorageError
     tx.commit().map_err(storage_error)
 }
 
+pub fn validate_restore_candidate(path: &Path) -> Result<(), StorageError> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| StorageError(format!("could not inspect backup: {error}")))?;
+    if !metadata.is_file() {
+        return Err(StorageError("backup must be a regular file".into()));
+    }
+    if metadata.len() < 100 {
+        return Err(StorageError(
+            "backup is too small to be a SQLite database".into(),
+        ));
+    }
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| StorageError(format!("could not open backup as SQLite: {error}")))?;
+    let version: usize = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(storage_error)?;
+    if version != LATEST_SCHEMA_VERSION {
+        return Err(StorageError(format!(
+            "backup schema version {version} is incompatible; this app requires version {LATEST_SCHEMA_VERSION}"
+        )));
+    }
+    let integrity: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(storage_error)?;
+    if integrity != "ok" {
+        return Err(StorageError(format!(
+            "backup integrity check failed: {integrity}"
+        )));
+    }
+    validate_database(&connection)
+}
+
 fn validate_database(connection: &Connection) -> Result<(), StorageError> {
     let integrity: String = connection
         .query_row("PRAGMA quick_check", [], |row| row.get(0))
@@ -1971,6 +3114,8 @@ fn validate_database(connection: &Connection) -> Result<(), StorageError> {
         "profile_release_interactions",
         "playlists",
         "playlist_items",
+        "history_coverage",
+        "downloads",
     ] {
         let exists: bool = connection
             .query_row(
@@ -2040,6 +3185,35 @@ fn upsert_song(tx: &Transaction<'_>, song: &Song) -> Result<(), StorageError> {
              album_name = COALESCE(excluded.album_name, songs.album_name),
              duration_ms = COALESCE(excluded.duration_ms, songs.duration_ms),
              thumbnail_url = COALESCE(excluded.thumbnail_url, songs.thumbnail_url)",
+        params![
+            song.id.as_str(),
+            song.title,
+            song.artist.id,
+            song.artist.name,
+            song.album_id,
+            song.album_name,
+            duration_ms,
+            song.thumbnail_url,
+        ],
+    )
+    .map_err(storage_error)?;
+    Ok(())
+}
+
+fn upsert_local_song(tx: &Transaction<'_>, song: &Song) -> Result<(), StorageError> {
+    let duration_ms = optional_sqlite_integer(song.duration_ms, "song duration_ms")?;
+    tx.execute(
+        "INSERT INTO songs
+         (song_id, title, artist_id, artist_name, album_id, album_name, duration_ms, thumbnail_url)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(song_id) DO UPDATE SET
+             title = excluded.title,
+             artist_id = excluded.artist_id,
+             artist_name = excluded.artist_name,
+             album_id = excluded.album_id,
+             album_name = excluded.album_name,
+             duration_ms = excluded.duration_ms,
+             thumbnail_url = excluded.thumbnail_url",
         params![
             song.id.as_str(),
             song.title,
@@ -2163,10 +3337,15 @@ fn storage_error(error: impl std::fmt::Display) -> StorageError {
 
 #[cfg(test)]
 mod tests {
-    use super::{SqliteMusicRepository, LATEST_SCHEMA_VERSION, MIGRATIONS};
+    use super::{
+        validate_restore_candidate, SqliteMusicRepository, LATEST_SCHEMA_VERSION, MIGRATIONS,
+    };
     use rusqlite::Connection;
-    use solmusic_application::{LibrarySource, MusicRepository, ScannedLocalTrack};
+    use solmusic_application::{
+        LibrarySource, MusicRepository, NormalizationGainMetadata, ScannedLocalTrack,
+    };
     use solmusic_domain::{ArtistRef, ListeningSummary, PlaybackEndReason, Song, SongId};
+    use std::fs;
 
     fn song(id: &str) -> Song {
         Song {
@@ -2185,15 +3364,22 @@ mod tests {
 
     fn scanned(track: Song, path: &str, source_identity: &str, seen_at: i64) -> ScannedLocalTrack {
         ScannedLocalTrack {
+            local_file_id: None,
             song: track,
             canonical_path: path.into(),
             relative_path: path.rsplit('/').next().unwrap_or(path).into(),
             mime_type: "audio/flac".into(),
             file_size_bytes: 42,
             modified_at_ms: seen_at,
+            modified_at_ns: Some(seen_at * 1_000_000),
             source_identity: Some(source_identity.into()),
+            sidecar_artwork_path: None,
+            sidecar_artwork_size_bytes: None,
+            sidecar_artwork_modified_at_ns: None,
+            normalization_gain_metadata: None,
             artist_names: vec!["Artist".into()],
             first_seen_at_ms: seen_at,
+            metadata_changed: true,
         }
     }
 
@@ -2213,6 +3399,30 @@ mod tests {
             duration_ms: Some(100_000),
             reason,
         }
+    }
+
+    #[test]
+    fn vacuum_backup_is_valid_and_future_schema_is_rejected() {
+        let root =
+            std::env::temp_dir().join(format!("sunnysong-backup-test-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&root).unwrap();
+        let repository = SqliteMusicRepository::open(root.join("live.sqlite3")).unwrap();
+        repository.save_songs(&[song("dQw4w9WgXcQ")]).unwrap();
+        let backup = root.join("backup.sqlite3");
+        repository.create_backup(&backup).unwrap();
+        validate_restore_candidate(&backup).unwrap();
+
+        let connection = Connection::open(&backup).unwrap();
+        connection
+            .pragma_update(None, "user_version", LATEST_SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(connection);
+        assert!(validate_restore_candidate(&backup)
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible"));
+        drop(repository);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2236,6 +3446,87 @@ mod tests {
             })
             .unwrap();
         assert_eq!(migrations, LATEST_SCHEMA_VERSION as i64);
+    }
+
+    #[test]
+    fn v10_migration_adds_nullable_local_gain_columns() {
+        let connection = Connection::open_in_memory().unwrap();
+        for migration in MIGRATIONS.iter().take(9) {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 9).unwrap();
+        connection
+            .execute(
+                "INSERT INTO music_directories (canonical_path, added_at_ms) VALUES ('/music', 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO songs (song_id, title, artist_name) VALUES ('local:old', 'Old', 'Artist')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO local_files
+                 (directory_id, canonical_path, relative_path, track_id, mime_type,
+                  file_size_bytes, modified_at_ms, first_seen_at_ms)
+                 VALUES (1, '/music/old.flac', 'old.flac', 'local:old', 'audio/flac', 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+
+        let repository = SqliteMusicRepository::from_connection(connection).unwrap();
+        let values: (Option<f64>, Option<f64>, Option<f64>, Option<f64>) = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT replay_gain_track_db, replay_gain_album_db,
+                        replay_gain_track_peak, replay_gain_album_peak
+                 FROM local_files WHERE track_id = 'local:old'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(values, (None, None, None, None));
+        let scan_state = repository.local_scan_state(1).unwrap();
+        assert_eq!(scan_state.len(), 1);
+        assert_eq!(scan_state[0].modified_at_ns, None);
+        assert_eq!(scan_state[0].sidecar_artwork_path, None);
+    }
+
+    #[test]
+    fn local_gain_metadata_round_trips_with_playback_source() {
+        let root = std::env::temp_dir().join(format!(
+            "sunnysong-replaygain-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("track.flac");
+        fs::write(&path, b"test").unwrap();
+        let repository = SqliteMusicRepository::open_in_memory().unwrap();
+        let directory = repository
+            .add_music_directory(root.to_str().unwrap(), 1)
+            .unwrap();
+        let metadata = NormalizationGainMetadata {
+            track_gain_db: Some(-7.25),
+            album_gain_db: Some(-6.5),
+            track_peak: Some(0.98),
+            album_peak: Some(1.01),
+        };
+        let mut track = scanned(song("local:gain"), path.to_str().unwrap(), "unix:gain", 2);
+        track.normalization_gain_metadata = Some(metadata);
+        repository
+            .replace_directory_scan(directory.id, &[track], 2, 0, true, 1)
+            .unwrap();
+
+        let source = repository
+            .local_playback_file(&SongId::new("local:gain").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.normalization_gain_metadata, Some(metadata));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2448,15 +3739,22 @@ mod tests {
             .replace_directory_scan(
                 directory.id,
                 &[ScannedLocalTrack {
+                    local_file_id: None,
                     song: track.clone(),
                     canonical_path: "/music/track.flac".into(),
                     relative_path: "track.flac".into(),
                     mime_type: "audio/flac".into(),
                     file_size_bytes: 42,
                     modified_at_ms: 2,
+                    modified_at_ns: Some(2_000_000),
                     source_identity: Some("unix:1:1".into()),
+                    sidecar_artwork_path: None,
+                    sidecar_artwork_size_bytes: None,
+                    sidecar_artwork_modified_at_ns: None,
+                    normalization_gain_metadata: None,
                     artist_names: vec!["Daft Punk".into(), "Pharrell Williams".into()],
                     first_seen_at_ms: 2,
+                    metadata_changed: true,
                 }],
                 2,
                 0,
@@ -2487,15 +3785,22 @@ mod tests {
             .replace_directory_scan(
                 directory.id,
                 &[ScannedLocalTrack {
+                    local_file_id: None,
                     song: track.clone(),
                     canonical_path: "/music/track.flac".into(),
                     relative_path: "track.flac".into(),
                     mime_type: "audio/flac".into(),
                     file_size_bytes: 42,
                     modified_at_ms: 3,
+                    modified_at_ns: Some(3_000_000),
                     source_identity: Some("unix:1:1".into()),
+                    sidecar_artwork_path: None,
+                    sidecar_artwork_size_bytes: None,
+                    sidecar_artwork_modified_at_ns: None,
+                    normalization_gain_metadata: None,
                     artist_names: vec!["Daft Punk".into(), "Pharrell Williams".into()],
                     first_seen_at_ms: 3,
+                    metadata_changed: true,
                 }],
                 3,
                 0,
@@ -2691,6 +3996,130 @@ mod tests {
             )
             .unwrap();
         assert!(retained);
+    }
+
+    #[test]
+    fn incremental_scan_keeps_new_duplicate_source_regardless_of_order() {
+        let repository = SqliteMusicRepository::open_in_memory().unwrap();
+        let directory = repository.add_music_directory("/music", 1).unwrap();
+        let track = song("local:duplicate-order");
+        repository
+            .replace_directory_scan(
+                directory.id,
+                &[scanned(
+                    track.clone(),
+                    "/music/z-original.flac",
+                    "unix:1:50",
+                    2,
+                )],
+                2,
+                0,
+                true,
+                1,
+            )
+            .unwrap();
+        let unchanged = repository.local_scan_state(directory.id).unwrap().remove(0);
+        let added = scanned(track.clone(), "/music/a-copy.flac", "unix:1:51", 3);
+
+        repository
+            .replace_directory_scan(directory.id, &[added, unchanged], 3, 0, true, 1)
+            .unwrap();
+        let connection = repository.connection().unwrap();
+        let sources: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM local_files WHERE track_id = ?1 AND missing_since_ms IS NULL",
+                [track.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sources, 2);
+    }
+
+    #[test]
+    fn local_metadata_update_removes_obsolete_artwork_reference() {
+        let repository = SqliteMusicRepository::open_in_memory().unwrap();
+        let directory = repository.add_music_directory("/music", 1).unwrap();
+        let mut track = song("local:artwork-removal");
+        track.thumbnail_url = Some("local-artwork:/cache/old.png".into());
+        repository
+            .replace_directory_scan(
+                directory.id,
+                &[scanned(
+                    track.clone(),
+                    "/music/artwork.flac",
+                    "unix:1:41",
+                    2,
+                )],
+                2,
+                0,
+                true,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            repository.referenced_local_artwork().unwrap(),
+            vec!["local-artwork:/cache/old.png"]
+        );
+
+        let mut changed = repository.local_scan_state(directory.id).unwrap();
+        changed[0].song.thumbnail_url = None;
+        changed[0].metadata_changed = true;
+        repository
+            .replace_directory_scan(directory.id, &changed, 3, 0, true, 1)
+            .unwrap();
+        assert!(repository.referenced_local_artwork().unwrap().is_empty());
+    }
+
+    #[test]
+    fn incremental_state_reports_unchanged_move_then_complete_deletion() {
+        let repository = SqliteMusicRepository::open_in_memory().unwrap();
+        let directory = repository.add_music_directory("/music", 1).unwrap();
+        let track = song("local:incremental");
+        repository
+            .replace_directory_scan(
+                directory.id,
+                &[scanned(
+                    track.clone(),
+                    "/music/original.flac",
+                    "unix:1:40",
+                    2,
+                )],
+                2,
+                0,
+                true,
+                1,
+            )
+            .unwrap();
+
+        let mut unchanged = repository.local_scan_state(directory.id).unwrap();
+        assert_eq!(unchanged.len(), 1);
+        assert!(unchanged[0].local_file_id.is_some());
+        assert!(!unchanged[0].metadata_changed);
+        unchanged[0].canonical_path = "/music/moved.flac".into();
+        unchanged[0].relative_path = "moved.flac".into();
+        let report = repository
+            .replace_directory_scan(directory.id, &unchanged, 3, 0, true, 1)
+            .unwrap();
+        assert_eq!(report.indexed_tracks, 0);
+        assert_eq!(report.unchanged_tracks, 1);
+        assert_eq!(report.unavailable_tracks, 0);
+        assert_eq!(
+            repository.local_scan_state(directory.id).unwrap()[0]
+                .song
+                .id,
+            track.id
+        );
+
+        let deleted = repository
+            .replace_directory_scan(directory.id, &[], 4, 0, true, 1)
+            .unwrap();
+        assert_eq!(deleted.indexed_tracks, 0);
+        assert_eq!(deleted.unchanged_tracks, 0);
+        assert_eq!(deleted.unavailable_tracks, 1);
+        assert!(repository
+            .search_local("incremental", 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -3136,10 +4565,13 @@ mod tests {
         assert!(profile.liked);
         assert_eq!(repository.artist_affinities().unwrap()["name:artist"], 9.0);
         assert_eq!(repository.recent_songs(10, None).unwrap().len(), 1);
+        let recap = repository.listening_recap(None, None, 10).unwrap();
+        assert!(recap.coverage.complete);
+        assert_eq!(recap.coverage.complete_from_ms, 123);
     }
 
     #[test]
-    fn recent_history_is_bounded_without_weakening_idempotency() {
+    fn history_is_durable_without_weakening_idempotency() {
         let repository = SqliteMusicRepository::open_in_memory().unwrap();
         let track = song("song-1");
         for index in 0..=1_000 {
@@ -3159,7 +4591,7 @@ mod tests {
             .unwrap()
             .query_row("SELECT COUNT(*) FROM recent_plays", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(recent_count, 1_000);
+        assert_eq!(recent_count, 1_001);
 
         repository
             .record_playback(&summary(
@@ -3172,5 +4604,340 @@ mod tests {
             .unwrap();
         let profile = repository.track_profiles(1).unwrap().pop().unwrap();
         assert_eq!(profile.play_count, 1_001);
+    }
+
+    #[test]
+    fn playlist_edits_are_atomic_and_keep_dense_positions() {
+        let repository = SqliteMusicRepository::open_in_memory().unwrap();
+        let playlist = repository.create_playlist("Original", 1).unwrap();
+        for id in ["one", "two", "three"] {
+            repository
+                .add_song_to_playlist(&playlist.id, &song(id), 2)
+                .unwrap();
+        }
+        let renamed = repository
+            .rename_playlist(&playlist.id, "Renamed", 3)
+            .unwrap();
+        assert_eq!(renamed.name, "Renamed");
+        let reordered = repository
+            .reorder_playlist_tracks(
+                &playlist.id,
+                &["three".into(), "one".into(), "two".into()],
+                4,
+            )
+            .unwrap();
+        assert_eq!(
+            reordered
+                .iter()
+                .map(|item| item.song.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["three", "one", "two"]
+        );
+        assert!(repository
+            .reorder_playlist_tracks(&playlist.id, &["one".into()], 5)
+            .is_err());
+        assert_eq!(repository.playlist_tracks(&playlist.id).unwrap(), reordered);
+        repository
+            .remove_song_from_playlist(&playlist.id, &SongId::new("one").unwrap(), 6)
+            .unwrap();
+        assert_eq!(
+            repository
+                .playlist_tracks(&playlist.id)
+                .unwrap()
+                .iter()
+                .map(|item| item.position)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        repository.delete_playlist(&playlist.id).unwrap();
+        assert!(repository.playlists().unwrap().is_empty());
+    }
+
+    #[test]
+    fn liked_songs_history_deletion_and_recap_are_profile_scoped() {
+        let repository = SqliteMusicRepository::open_in_memory().unwrap();
+        let first = song("first");
+        let second = song("second");
+        repository.set_reaction(&first, true, false).unwrap();
+        repository
+            .record_playback(&summary(
+                "one",
+                first.clone(),
+                100_000,
+                PlaybackEndReason::Completed,
+                100,
+            ))
+            .unwrap();
+        repository
+            .record_playback(&summary(
+                "two",
+                second.clone(),
+                10_000,
+                PlaybackEndReason::Next,
+                200,
+            ))
+            .unwrap();
+        assert_eq!(repository.liked_songs(10, 0).unwrap(), vec![first.clone()]);
+        assert_eq!(repository.history_events(10, None).unwrap().len(), 2);
+        let recap = repository.listening_recap(None, None, 10).unwrap();
+        assert_eq!(recap.total_listened_ms, 110_000);
+        assert_eq!(recap.plays, 2);
+        assert_eq!(recap.completions, 1);
+        assert_eq!(recap.skips, 1);
+        assert!(recap.coverage.complete);
+        repository.delete_history_event("two").unwrap();
+        assert_eq!(
+            repository
+                .track_profiles(10)
+                .unwrap()
+                .into_iter()
+                .find(|item| item.song.id == second.id)
+                .map(|item| item.early_skip_count),
+            Some(0)
+        );
+        assert_eq!(repository.delete_song_history(&first.id).unwrap(), 1);
+        assert!(repository.history_events(10, None).unwrap().is_empty());
+        let retained_like = repository
+            .track_profiles(10)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.song.id == first.id)
+            .unwrap();
+        assert!(retained_like.liked);
+        assert_eq!(retained_like.affinity, 3.0);
+    }
+
+    #[test]
+    fn history_deletion_retains_tombstones_and_replays_artist_ema() {
+        let repository = SqliteMusicRepository::open_in_memory().unwrap();
+        let first = song("ema-first");
+        let second = song("ema-second");
+        let third = song("ema-third");
+        repository
+            .record_playback(&summary(
+                "ema-one",
+                first,
+                100_000,
+                PlaybackEndReason::Completed,
+                10,
+            ))
+            .unwrap();
+        repository
+            .record_playback(&summary(
+                "ema-two",
+                second.clone(),
+                0,
+                PlaybackEndReason::Stopped,
+                20,
+            ))
+            .unwrap();
+        repository
+            .record_playback(&summary(
+                "ema-three",
+                third,
+                50_000,
+                PlaybackEndReason::Stopped,
+                30,
+            ))
+            .unwrap();
+
+        repository.delete_history_event("ema-two").unwrap();
+        let artist_ema: f64 = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT completion_ema FROM profile_artist_stats",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!((artist_ema - 0.9).abs() < 1e-12);
+
+        let mut delayed_retry =
+            summary("ema-two", second, 100_000, PlaybackEndReason::Completed, 40);
+        delayed_retry.profile_id = repository.active_listening_profile().unwrap().id;
+        repository.record_playback(&delayed_retry).unwrap();
+        assert_eq!(repository.history_events(10, None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn incomplete_history_deletion_preserves_legacy_aggregates() {
+        let repository = SqliteMusicRepository::open_in_memory().unwrap();
+        let track = song("legacy-signal");
+        repository
+            .record_playback(&summary(
+                "legacy-visible",
+                track.clone(),
+                100_000,
+                PlaybackEndReason::Completed,
+                10,
+            ))
+            .unwrap();
+        repository
+            .connection()
+            .unwrap()
+            .execute("UPDATE history_coverage SET legacy_incomplete = 1", [])
+            .unwrap();
+
+        repository.delete_song_history(&track.id).unwrap();
+        assert!(repository.history_events(10, None).unwrap().is_empty());
+        let profile = repository.track_profiles(10).unwrap().pop().unwrap();
+        assert_eq!(profile.play_count, 1);
+        assert_eq!(profile.completed_count, 1);
+        assert_eq!(profile.affinity, 2.0);
+    }
+
+    #[test]
+    fn v9_migration_reports_truthful_history_boundaries() {
+        fn migrated_coverage(event_count: usize) -> (i64, bool) {
+            let connection = Connection::open_in_memory().unwrap();
+            for migration in MIGRATIONS.iter().take(8) {
+                connection.execute_batch(migration).unwrap();
+            }
+            connection.pragma_update(None, "user_version", 8).unwrap();
+            let profile_id = "00000000-0000-7000-8000-000000000001";
+            connection
+                .execute(
+                    "UPDATE profiles SET created_at_ms = 50 WHERE profile_id = ?1",
+                    [profile_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO songs (song_id, title, artist_name) VALUES ('migration-song', 'Song', 'Artist')",
+                    [],
+                )
+                .unwrap();
+            for index in 0..event_count {
+                let event_id = format!("migration-{index}");
+                connection
+                    .execute(
+                        "INSERT INTO processed_playback_events (profile_id, event_id) VALUES (?1, ?2)",
+                        rusqlite::params![profile_id, event_id],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO recent_plays
+                         (profile_id, event_id, song_id, started_at_ms, listened_ms, end_reason)
+                         VALUES (?1, ?2, 'migration-song', ?3, 1, 'Stopped')",
+                        rusqlite::params![profile_id, event_id, 100 + index as i64],
+                    )
+                    .unwrap();
+            }
+            let repository = SqliteMusicRepository::from_connection(connection).unwrap();
+            let coverage = repository
+                .connection()
+                .unwrap()
+                .query_row(
+                    "SELECT complete_from_ms, legacy_incomplete FROM history_coverage WHERE profile_id = ?1",
+                    [profile_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            coverage
+        }
+
+        assert_eq!(migrated_coverage(0), (50, false));
+        assert_eq!(migrated_coverage(2), (50, false));
+        assert_eq!(migrated_coverage(1_000), (100, true));
+    }
+
+    #[test]
+    fn download_finalization_uses_attempt_identity_after_profile_switch() {
+        let repository = SqliteMusicRepository::open_in_memory().unwrap();
+        let main = repository.active_listening_profile().unwrap();
+        let attempt = repository
+            .create_download_attempt(&song("switch-download"), 10)
+            .unwrap();
+        let other = repository.create_listening_profile("Other", 20).unwrap();
+        repository
+            .set_active_listening_profile(&other.id, 30)
+            .unwrap();
+        repository
+            .finish_download_attempt(
+                &attempt.id,
+                "completed",
+                Some("/music/switch.m4a"),
+                Some("switch.m4a"),
+                None,
+                40,
+            )
+            .unwrap();
+        assert!(repository.downloads(10, 0).unwrap().is_empty());
+        repository
+            .set_active_listening_profile(&main.id, 50)
+            .unwrap();
+        assert_eq!(repository.downloads(10, 0).unwrap()[0].status, "completed");
+    }
+
+    #[test]
+    fn marking_deleted_local_file_missing_removes_it_from_library() {
+        let repository = SqliteMusicRepository::open_in_memory().unwrap();
+        let directory = repository.add_music_directory("/music", 1).unwrap();
+        let track = song("local:deleted-download");
+        repository
+            .replace_directory_scan(
+                directory.id,
+                &[scanned(
+                    track.clone(),
+                    "/music/deleted.flac",
+                    "unix:1:77",
+                    2,
+                )],
+                2,
+                0,
+                true,
+                1,
+            )
+            .unwrap();
+        repository
+            .mark_local_file_missing("/music/deleted.flac", 3)
+            .unwrap();
+        assert!(repository.search_local("deleted", 10).unwrap().is_empty());
+        assert_eq!(repository.music_directories().unwrap()[0].track_count, 0);
+    }
+
+    #[test]
+    fn suggestions_and_download_registry_are_durable() {
+        let repository = SqliteMusicRepository::open_in_memory().unwrap();
+        let mut track = song("download");
+        track.title = "Sunrise Drive".into();
+        track.artist.name = "Sunny Artist".into();
+        repository.save_songs(std::slice::from_ref(&track)).unwrap();
+        let suggestions = repository.local_text_suggestions("Sun", 10).unwrap();
+        assert!(suggestions.contains(&"Sunrise Drive".into()));
+        assert!(suggestions.contains(&"Sunny Artist".into()));
+        let attempt = repository.create_download_attempt(&track, 10).unwrap();
+        repository
+            .finish_download_attempt(
+                &attempt.id,
+                "completed",
+                Some("/music/file.m4a"),
+                Some("file.m4a"),
+                None,
+                20,
+            )
+            .unwrap();
+        let downloads = repository.downloads(10, 0).unwrap();
+        assert_eq!(downloads[0].status, "completed");
+        assert_eq!(downloads[0].location.as_deref(), Some("/music/file.m4a"));
+        repository.remove_download(&attempt.id).unwrap();
+        let failed = repository.create_download_attempt(&track, 30).unwrap();
+        repository
+            .finish_download_attempt(
+                &failed.id,
+                "failed",
+                None,
+                None,
+                Some("network unavailable"),
+                40,
+            )
+            .unwrap();
+        let failed_record = repository.downloads(10, 0).unwrap().pop().unwrap();
+        assert_eq!(failed_record.status, "failed");
+        assert_eq!(failed_record.error.as_deref(), Some("network unavailable"));
+        repository.remove_download(&failed.id).unwrap();
+        assert!(repository.downloads(10, 0).unwrap().is_empty());
     }
 }

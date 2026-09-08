@@ -182,6 +182,7 @@ impl PlaybackResolver {
             mime_type: "audio/mp4; codecs=\"mp4a.40.2\"".into(),
             local_path: None,
             request_profile: PlaybackRequestProfile::Web,
+            normalization_gain_metadata: None,
         };
         if source_is_fresh(&source) {
             self.cache
@@ -400,6 +401,7 @@ mod tests {
             expires_at_ms,
             local_path: None,
             request_profile: PlaybackRequestProfile::Web,
+            normalization_gain_metadata: None,
         };
         assert!(source_is_fresh(&source(Some(now_ms + 180_000))));
         assert!(!source_is_fresh(&source(Some(now_ms + 60_000))));

@@ -28,6 +28,8 @@ pub enum AppError {
     EmptyQueue,
     #[error("the queue has no item in that direction")]
     QueueBoundary,
+    #[error("invalid queue operation: {0}")]
+    InvalidQueueOperation(String),
     #[error("a newer playback operation replaced this request")]
     StalePlaybackOperation,
 }

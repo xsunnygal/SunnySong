@@ -6,6 +6,7 @@
     getArtistPage,
     getCollectionSongs,
     getLocalArtists,
+    getSearchSuggestions,
     searchCatalog,
     searchLocalMusic,
     type ArtistPage,
@@ -19,6 +20,8 @@
   import { player } from "$lib/features/player/player.svelte";
 
   const SUBSCRIPTIONS_KEY = "solmusic-artist-subscriptions";
+  type LocalCatalogCollection = CatalogCollection & { localLibrary: true };
+  const localCollections = new WeakSet<CatalogCollection>();
   const filters: { value: CatalogFilter; label: string }[] = [
     { value: "all", label: "All" },
     { value: "songs", label: "Songs" },
@@ -37,21 +40,31 @@
   let onlinePlaylists = $state<CatalogCollection[]>([]);
   let loading = $state(false);
   let message = $state("Search your local library and YouTube Music.");
+  let searchFailed = $state(false);
   let selectedArtist = $state<CatalogArtist | null>(null);
   let artistPage = $state<ArtistPage | null>(null);
   let artistLoading = $state(false);
   let artistMessage = $state("");
+  let artistFailed = $state(false);
   let selectedCollection = $state<CatalogCollection | null>(null);
   let collectionSongs = $state<Song[]>([]);
   let collectionLoading = $state(false);
   let collectionMessage = $state("");
+  let collectionFailed = $state(false);
   let artistSongMode = $state<"top" | "latest">("top");
   let subscribedArtistIds = $state<string[]>([]);
   let timer: ReturnType<typeof setTimeout>;
+  let searchInput = $state<HTMLInputElement | null>(null);
+  let suggestions = $state<string[]>([]);
+  let suggestionsOpen = $state(false);
+  let suggestionIndex = $state(-1);
+  let suggestionSequence = 0;
+  let hasSearched = $state(false);
   let cachedLocalArtistsVersion = -1;
   let cachedLocalArtists: Promise<LocalArtist[]> | null = null;
   let sequence = 0;
   let artistSequence = 0;
+  let collectionSequence = 0;
   let observedLibraryVersion = -1;
   let artistTouchX = 0;
   let artistTouchY = 0;
@@ -112,19 +125,22 @@
     };
   }
 
-  function collectionsFromSongs(songs: Song[]): CatalogCollection[] {
-    const collections = new Map<string, CatalogCollection>();
+  function collectionsFromSongs(songs: Song[]): LocalCatalogCollection[] {
+    const collections = new Map<string, LocalCatalogCollection>();
     for (const song of songs) {
       if (!song.albumName) continue;
       const id = song.albumId ?? `local-album:${normalized(song.artistName)}:${normalized(song.albumName)}`;
       if (!collections.has(id)) {
-        collections.set(id, {
+        const collection: LocalCatalogCollection = {
           id,
           title: song.albumName,
           subtitle: `${song.artistName} · Local album`,
           thumbnailUrl: song.thumbnailUrl,
           kind: "album",
-        });
+          localLibrary: true,
+        };
+        localCollections.add(collection);
+        collections.set(id, collection);
       }
     }
     return [...collections.values()];
@@ -139,39 +155,76 @@
   }
 
   function searchKeydown(event: KeyboardEvent) {
-    if (event.key === "Enter") {
+    if ((event.key === "ArrowDown" || event.key === "ArrowUp") && suggestionsOpen && suggestions.length) {
+      event.preventDefault();
+      suggestionIndex = (suggestionIndex + (event.key === "ArrowDown" ? 1 : -1) + suggestions.length) % suggestions.length;
+    } else if (event.key === "Enter") {
       event.preventDefault();
       clearTimeout(timer);
-      (event.currentTarget as HTMLInputElement).blur();
+      if (suggestionsOpen && suggestionIndex >= 0) query = suggestions[suggestionIndex];
+      suggestionsOpen = false;
       closeArtist();
       void runSearch();
     } else if (event.key === "Escape") {
-      query = "";
-      clearTimeout(timer);
-      closeArtist();
-      clearResults();
-      message = "Search your local library and YouTube Music.";
-      (event.currentTarget as HTMLInputElement).blur();
+      if (suggestionsOpen) {
+        event.stopPropagation();
+        suggestionsOpen = false;
+        suggestionIndex = -1;
+      } else {
+        query = "";
+        clearTimeout(timer);
+        closeArtist();
+        clearResults();
+        hasSearched = false;
+        searchFailed = false;
+        message = "Search your local library and YouTube Music.";
+        (event.currentTarget as HTMLInputElement).blur();
+      }
     }
   }
 
   function changed() {
     clearTimeout(timer);
+    const value = query.trim();
+    suggestionIndex = -1;
     closeArtist();
-    if (!query.trim()) {
-      sequence += 1;
-      clearResults();
-      message = "Search your local library and YouTube Music.";
+    sequence += 1;
+    clearResults();
+    hasSearched = false;
+    message = "";
+    searchFailed = false;
+    if (!value) {
+      suggestionSequence += 1;
+      suggestions = [];
+      suggestionsOpen = false;
+      if (!hasSearched) message = "Search your local library and YouTube Music.";
       return;
     }
-    timer = setTimeout(runSearch, 180);
+    const current = ++suggestionSequence;
+    timer = setTimeout(async () => {
+      try {
+        const next = await getSearchSuggestions(value, 8);
+        if (current !== suggestionSequence || query.trim() !== value) return;
+        suggestions = next;
+        suggestionsOpen = next.length > 0;
+      } catch {
+        if (current === suggestionSequence) suggestionsOpen = false;
+      }
+    }, 100);
+  }
+
+  function chooseSuggestion(value: string) {
+    query = value;
+    suggestionsOpen = false;
+    suggestionIndex = -1;
+    void runSearch();
   }
 
   function selectFilter(value: CatalogFilter) {
     if (filter === value) return;
     filter = value;
     closeArtist();
-    if (query.trim()) void runSearch();
+    if (query.trim() && hasSearched) void runSearch();
   }
 
   function clearResults() {
@@ -189,7 +242,11 @@
     const value = query.trim();
     if (!value) return;
     loading = true;
+    hasSearched = true;
+    suggestionsOpen = false;
+    suggestionSequence += 1;
     message = "";
+    searchFailed = false;
     clearResults();
     loading = true;
     try {
@@ -223,12 +280,16 @@
       if (current !== sequence) return;
       const failures = results.filter((result) => result.status === "rejected");
       const resultCount = localSongs.length + localArtists.length + onlineSongs.length + onlineArtists.length + onlineAlbums.length + onlinePlaylists.length;
-      if (resultCount && failures.length) message = "Some search categories could not be loaded.";
+      searchFailed = failures.length > 0;
+      if (resultCount && failures.length) message = typeof navigator !== "undefined" && !navigator.onLine ? "You’re offline. Local results are shown; online categories could not be loaded." : "Some search categories could not be loaded.";
       else if (resultCount) message = "";
-      else if (failures[0]?.status === "rejected") message = failures[0].reason instanceof Error ? failures[0].reason.message : String(failures[0].reason);
+      else if (failures[0]?.status === "rejected") message = typeof navigator !== "undefined" && !navigator.onLine ? "Search is unavailable while offline. Check your connection and retry." : failures[0].reason instanceof Error ? failures[0].reason.message : String(failures[0].reason);
       else message = "No matching music found.";
     } catch (error) {
-      if (current === sequence) message = error instanceof Error ? error.message : String(error);
+      if (current === sequence) {
+        searchFailed = true;
+        message = error instanceof Error ? error.message : String(error);
+      }
     } finally {
       if (current === sequence) loading = false;
     }
@@ -239,6 +300,7 @@
     selectedArtist = artist;
     artistSongMode = "top";
     artistMessage = "";
+    artistFailed = false;
     artistLoading = true;
     artistPage = null;
     if (artist.source === "local") {
@@ -256,7 +318,10 @@
           playlists: [],
         };
       } catch (error) {
-        if (current === artistSequence) artistMessage = error instanceof Error ? error.message : String(error);
+        if (current === artistSequence) {
+          artistFailed = true;
+          artistMessage = error instanceof Error ? error.message : String(error);
+        }
       } finally {
         if (current === artistSequence) artistLoading = false;
       }
@@ -269,38 +334,55 @@
       const firstSong = page.topSongs[0] ?? page.songs[0];
       if (firstSong) player.preload(firstSong);
     } catch (error) {
-      if (current === artistSequence) artistMessage = error instanceof Error ? error.message : String(error);
+      if (current === artistSequence) {
+        artistFailed = true;
+        artistMessage = error instanceof Error ? error.message : String(error);
+      }
     } finally {
       if (current === artistSequence) artistLoading = false;
     }
   }
 
+  function isLocalCollection(collection: CatalogCollection): collection is LocalCatalogCollection {
+    return localCollections.has(collection);
+  }
+
   async function openCollection(collection: CatalogCollection) {
+    const current = ++collectionSequence;
     selectedCollection = collection;
     collectionSongs = [];
     collectionMessage = "";
+    collectionFailed = false;
     collectionLoading = true;
     try {
-      if (selectedArtist?.source === "local") {
+      let songs: Song[];
+      if (isLocalCollection(collection)) {
         const sourceSongs = [...(artistPage?.topSongs ?? []), ...(artistPage?.songs ?? []), ...localSongs];
-        collectionSongs = sourceSongs.filter((song) => song.albumId === collection.id || (song.albumName && normalized(song.albumName) === normalized(collection.title)));
+        songs = sourceSongs.filter((song) => song.albumId === collection.id || (song.albumName && normalized(song.albumName) === normalized(collection.title)));
       } else {
-        collectionSongs = await getCollectionSongs(collection.id);
+        songs = await getCollectionSongs(collection.id);
       }
-      if (!collectionSongs.length) collectionMessage = "No songs were reported for this collection.";
-      else player.preload(collectionSongs[0]);
+      if (current !== collectionSequence) return;
+      collectionSongs = songs;
+      if (!songs.length) collectionMessage = "No songs were reported for this collection.";
+      else player.preload(songs[0]);
     } catch (error) {
-      collectionMessage = error instanceof Error ? error.message : String(error);
+      if (current === collectionSequence) {
+        collectionFailed = true;
+        collectionMessage = error instanceof Error ? error.message : String(error);
+      }
     } finally {
-      collectionLoading = false;
+      if (current === collectionSequence) collectionLoading = false;
     }
   }
 
   function closeCollection() {
+    collectionSequence += 1;
     selectedCollection = null;
     collectionSongs = [];
     collectionLoading = false;
     collectionMessage = "";
+    collectionFailed = false;
   }
 
   function closeArtist() {
@@ -310,6 +392,7 @@
     artistPage = null;
     artistLoading = false;
     artistMessage = "";
+    artistFailed = false;
   }
 
   function isSubscribed(artistId: string) {
@@ -344,6 +427,7 @@
 
   onMount(() => {
     void library.initialize();
+    queueMicrotask(() => searchInput?.focus());
     const hashQuery = location.hash.includes("?") ? location.hash.slice(location.hash.indexOf("?") + 1) : "";
     const params = new URLSearchParams(hashQuery);
     const routedQuery = params.get("q")?.trim() ?? "";
@@ -370,26 +454,29 @@
 
 <svelte:head><title>Search · SunnySong</title></svelte:head>
 
+<p class="sr-only" role="status" aria-live="polite">{loading ? "Searching" : artistLoading ? "Loading artist" : collectionLoading ? "Loading collection" : ""}</p>
 <div class="search-header">
   <button class="icon-button" type="button" aria-label={selectedCollection ? "Back to artist" : selectedArtist ? "Back to search results" : "Back to Home"} onclick={() => selectedCollection ? closeCollection() : selectedArtist ? closeArtist() : void goto("#/")}>←</button>
   <label class="search-field">
     <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m16 16 4 4" /></svg>
     <span class="sr-only">Search music</span>
-    <input placeholder="Search songs, artists, or lyrics…" bind:value={query} oninput={changed} onkeydown={searchKeydown} />
+    <input bind:this={searchInput} role="combobox" aria-autocomplete="list" aria-expanded={suggestionsOpen} aria-controls="search-suggestions" aria-activedescendant={suggestionIndex >= 0 ? `suggestion-${suggestionIndex}` : undefined} placeholder="Search songs, artists, or lyrics…" bind:value={query} oninput={changed} onkeydown={searchKeydown} onfocus={() => suggestionsOpen = suggestions.length > 0} />
+    {#if suggestionsOpen}<div id="search-suggestions" class="search-suggestions" role="listbox" aria-label="Search suggestions">{#each suggestions as suggestion, index}<button id={`suggestion-${index}`} type="button" role="option" aria-selected={index === suggestionIndex} class:active={index === suggestionIndex} onpointerdown={(event) => event.preventDefault()} onclick={() => chooseSuggestion(suggestion)}>{suggestion}</button>{/each}</div>{/if}
   </label>
 </div>
 
-{#if selectedArtist}
+{#if selectedArtist || selectedCollection}
   <main class="artist-browser">
     {#if selectedCollection}
       <header class="artist-profile-large collection-profile">
         {#if selectedCollection.thumbnailUrl}<img src={library.image(selectedCollection.thumbnailUrl) ?? ""} alt="" />{:else}<span class="artist-avatar-fallback" aria-hidden="true">♫</span>{/if}
-        <div><small>{selectedCollection.kind}</small><h1>{selectedCollection.title}</h1><p>{selectedCollection.subtitle ?? selectedArtist.name}</p></div>
+        <div><small>{selectedCollection.kind}</small><h1>{selectedCollection.title}</h1><p>{selectedCollection.subtitle ?? selectedArtist?.name ?? "Collection"}</p></div>
       </header>
+      {#if collectionSongs.length}<div class="collection-actions"><button class="primary-action" type="button" onclick={() => player.playAll(collectionSongs)}>Play all</button><button class="secondary-action" type="button" onclick={() => player.shuffle(collectionSongs)}>Shuffle</button></div>{/if}
       {#if collectionLoading}<div class="song-list" aria-label="Loading collection"><div class="row-skeleton skeleton"></div><div class="row-skeleton skeleton"></div><div class="row-skeleton skeleton"></div></div>
-      {:else if collectionMessage}<p class="inline-message">{collectionMessage}</p>
-      {:else}<div class="song-list artist-songs">{#each collectionSongs as song (song.id)}<SongRow {song} detail={selectedArtist.source === "local" ? "LOCAL" : "YT"} />{/each}</div>{/if}
-    {:else}
+      {:else if collectionMessage}<p class="inline-message" role={collectionFailed ? "alert" : "status"}>{collectionMessage} {#if collectionFailed}<button class="text-button" type="button" onclick={() => selectedCollection && openCollection(selectedCollection)}>Retry</button>{/if}</p>
+      {:else}<div class="song-list artist-songs">{#each collectionSongs as song (song.id)}<SongRow {song} detail={isLocalCollection(selectedCollection) ? "LOCAL" : "YT"} />{/each}</div>{/if}
+    {:else if selectedArtist}
     <header class="artist-profile-large">
       {#if artistArtwork}<img src={library.image(artistArtwork) ?? ""} alt={`${artistPage?.artist.name ?? selectedArtist.name} artist`} />{:else}<span class="artist-avatar-fallback" aria-hidden="true">♫</span>{/if}
       <div><small>{selectedArtist.source === "local" ? "Local artist" : "Artist"}</small><h1>{artistPage?.artist.name ?? selectedArtist.name}</h1><p>{artistPage?.artist.subtitle ?? selectedArtist.subtitle ?? ""}</p></div>
@@ -397,9 +484,10 @@
     </header>
 
     {#if artistLoading}<div class="song-list" aria-label="Loading artist"><div class="row-skeleton skeleton"></div><div class="row-skeleton skeleton"></div><div class="row-skeleton skeleton"></div></div>
-    {:else if artistMessage}<p class="inline-message">{artistMessage}</p>
+    {:else if artistMessage}<p class="inline-message" role="alert">{artistMessage} {#if artistFailed}<button class="text-button" type="button" onclick={() => selectedArtist && openArtist(selectedArtist)}>Retry</button>{/if}</p>
     {:else if artistPage}
       <section class="artist-song-section" aria-label="Artist songs and latest releases" ontouchstart={artistTouchStart} ontouchend={artistTouchEnd}>
+        {#if visibleArtistSongs.length}<div class="collection-actions"><button class="primary-action" type="button" onclick={() => player.playAll(visibleArtistSongs)}>Play all</button><button class="secondary-action" type="button" onclick={() => player.shuffle(visibleArtistSongs)}>Shuffle</button></div>{/if}
         <div class="section-heading"><h2>{artistPage.topSongs.length ? "Top Songs" : "Songs"}</h2>{#if artistPage.latestReleases.length}<div class="segmented-control compact"><button class:active={artistSongMode === "top"} aria-pressed={artistSongMode === "top"} onclick={() => artistSongMode = "top"}>Top</button><button class:active={artistSongMode === "latest"} aria-pressed={artistSongMode === "latest"} onclick={() => artistSongMode = "latest"}>Latest</button></div>{/if}</div>
         {#if artistSongMode === "top"}
           {#if visibleArtistSongs.length}<div class="song-list artist-songs">{#each visibleArtistSongs as song (song.id)}<SongRow {song} detail={selectedArtist.source === "local" ? "LOCAL" : "YT"} />{/each}</div>{:else}<p class="inline-message">No songs were reported for this artist.</p>{/if}
@@ -421,7 +509,7 @@
   </div>
 
   <main class="catalog-search-results">
-    {#if message}<p class="inline-message">{message}</p>{/if}
+    {#if message}<p class="inline-message" role={searchFailed ? "alert" : "status"}>{message} {#if searchFailed}<button class="text-button" type="button" onclick={runSearch}>Retry</button>{/if}</p>{/if}
 
     {#if showArtists && visibleCloseArtists.length}
       <section class="artist-match-section"><h1 class="compact-title">Artists</h1><div class="artist-match-grid">
@@ -442,12 +530,12 @@
     {/if}
 
     {#if showAlbums && (localAlbums.length || onlineAlbums.length)}
-      <section class="catalog-section"><h2>Albums</h2><div class="catalog-strip">{#each [...localAlbums, ...onlineAlbums] as item (item.id)}<article class="catalog-card">{#if item.thumbnailUrl}<img src={library.image(item.thumbnailUrl) ?? ""} alt="" loading="lazy" />{:else}<span aria-hidden="true">♫</span>{/if}<strong>{item.title}</strong><small>{item.subtitle ?? "Album"}</small></article>{/each}</div></section>
+      <section class="catalog-section"><h2>Albums</h2><div class="catalog-strip">{#each [...localAlbums, ...onlineAlbums] as item (item.id)}<button class="catalog-card catalog-card-button" type="button" onclick={() => openCollection(item)}>{#if item.thumbnailUrl}<img src={library.image(item.thumbnailUrl) ?? ""} alt="" loading="lazy" />{:else}<span aria-hidden="true">♫</span>{/if}<strong>{item.title}</strong><small>{item.subtitle ?? "Album"}</small></button>{/each}</div></section>
     {/if}
 
     {#if showPlaylists && onlinePlaylists.length}
-      <section class="catalog-section"><h2>Playlists</h2><div class="catalog-strip">{#each onlinePlaylists as item (item.id)}<article class="catalog-card">{#if item.thumbnailUrl}<img src={library.image(item.thumbnailUrl) ?? ""} alt="" loading="lazy" />{:else}<span aria-hidden="true">♫</span>{/if}<strong>{item.title}</strong><small>{item.subtitle ?? "Playlist"}</small></article>{/each}</div></section>
+      <section class="catalog-section"><h2>Playlists</h2><div class="catalog-strip">{#each onlinePlaylists as item (item.id)}<button class="catalog-card catalog-card-button" type="button" onclick={() => openCollection(item)}>{#if item.thumbnailUrl}<img src={library.image(item.thumbnailUrl) ?? ""} alt="" loading="lazy" />{:else}<span aria-hidden="true">♫</span>{/if}<strong>{item.title}</strong><small>{item.subtitle ?? "Playlist"}</small></button>{/each}</div></section>
     {/if}
-    {#if loading}<div class="song-list progressive-loading" aria-label="Searching for more results"><div class="row-skeleton skeleton"></div><div class="row-skeleton skeleton"></div></div>{/if}
+    {#if loading}<div class="song-list progressive-loading" aria-hidden="true"><div class="row-skeleton skeleton"></div><div class="row-skeleton skeleton"></div></div>{/if}
   </main>
 {/if}

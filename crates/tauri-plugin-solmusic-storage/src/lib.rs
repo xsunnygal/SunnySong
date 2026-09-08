@@ -4,6 +4,8 @@ use tauri::{
     Manager, Runtime,
 };
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(mobile)]
 mod mobile;
 
@@ -15,6 +17,9 @@ pub enum Error {
     #[cfg(desktop)]
     #[error("native storage selection is only available on mobile")]
     Unsupported,
+    #[cfg(target_os = "linux")]
+    #[error("the Linux media-session worker is unavailable")]
+    MediaSessionUnavailable,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -64,6 +69,17 @@ pub struct SecretResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MediaSessionItem {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub album: Option<String>,
+    pub artwork_url: Option<String>,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MediaSessionUpdate {
     pub active: bool,
     pub title: String,
@@ -75,11 +91,19 @@ pub struct MediaSessionUpdate {
     pub duration_ms: u64,
     pub can_go_previous: bool,
     pub can_go_next: bool,
+    #[serde(default)]
+    pub queue: Vec<MediaSessionItem>,
+    #[serde(default)]
+    pub current_item: Option<MediaSessionItem>,
+    #[serde(default)]
+    pub current_index: Option<usize>,
 }
 
 pub struct Storage<R: Runtime> {
     #[cfg(mobile)]
     handle: tauri::plugin::PluginHandle<R>,
+    #[cfg(target_os = "linux")]
+    media_session: linux::MediaSession,
     #[cfg(desktop)]
     _runtime: std::marker::PhantomData<fn() -> R>,
 }
@@ -149,7 +173,12 @@ impl<R: Runtime> Storage<R> {
         Ok(())
     }
 
-    #[cfg(desktop)]
+    #[cfg(target_os = "linux")]
+    pub fn update_media_session(&self, update: MediaSessionUpdate) -> Result<()> {
+        self.media_session.update(update)
+    }
+
+    #[cfg(all(desktop, not(target_os = "linux")))]
     pub fn update_media_session(&self, _update: MediaSessionUpdate) -> Result<()> {
         Ok(())
     }
@@ -176,21 +205,91 @@ impl<R: Runtime, T: Manager<R>> StorageExt<R> for T {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn register_listener<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    event: String,
+    handler: tauri::ipc::Channel<linux::MediaControl>,
+) -> std::result::Result<(), String> {
+    app.state::<Storage<R>>()
+        .media_session
+        .register_listener(&event, handler)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn remove_listener<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    event: String,
+    channel_id: u32,
+) -> std::result::Result<(), String> {
+    app.state::<Storage<R>>()
+        .media_session
+        .remove_listener(&event, channel_id)
+}
+
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
-    Builder::new("solmusic-storage")
-        .setup(|app, api| {
-            #[cfg(desktop)]
-            let _ = &api;
-            #[cfg(mobile)]
-            let storage = Storage {
-                handle: mobile::init(app, api)?,
-            };
-            #[cfg(desktop)]
-            let storage: Storage<R> = Storage {
-                _runtime: std::marker::PhantomData,
-            };
-            app.manage(storage);
-            Ok(())
-        })
-        .build()
+    let builder = Builder::new("solmusic-storage").setup(|app, api| {
+        #[cfg(desktop)]
+        let _ = &api;
+        #[cfg(mobile)]
+        let storage = Storage {
+            handle: mobile::init(app, api)?,
+        };
+        #[cfg(target_os = "linux")]
+        let storage: Storage<R> = Storage {
+            media_session: linux::MediaSession::new(),
+            _runtime: std::marker::PhantomData,
+        };
+        #[cfg(all(desktop, not(target_os = "linux")))]
+        let storage: Storage<R> = Storage {
+            _runtime: std::marker::PhantomData,
+        };
+        app.manage(storage);
+        Ok(())
+    });
+
+    #[cfg(target_os = "linux")]
+    let builder =
+        builder.invoke_handler(tauri::generate_handler![register_listener, remove_listener]);
+
+    builder.build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MediaSessionItem, MediaSessionUpdate};
+
+    #[test]
+    fn media_snapshot_serializes_browse_metadata_without_stream_urls() {
+        let update = MediaSessionUpdate {
+            active: true,
+            title: "Track".into(),
+            artist: "Artist".into(),
+            album: None,
+            artwork_url: Some("https://images.example/art.jpg".into()),
+            playing: false,
+            position_ms: 42,
+            duration_ms: 120_000,
+            can_go_previous: false,
+            can_go_next: false,
+            queue: vec![MediaSessionItem {
+                id: "catalog-id".into(),
+                title: "Track".into(),
+                artist: "Artist".into(),
+                album: None,
+                artwork_url: None,
+                duration_ms: 120_000,
+            }],
+            current_item: None,
+            current_index: Some(0),
+        };
+
+        let json = serde_json::to_value(update).expect("snapshot should serialize");
+        assert_eq!(json["currentIndex"], 0);
+        assert_eq!(json["queue"][0]["id"], "catalog-id");
+        assert!(json.get("streamUrl").is_none());
+        assert!(json["queue"][0].get("streamUrl").is_none());
+    }
 }

@@ -18,6 +18,14 @@ pub struct ArtistRef {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct NormalizationGainMetadata {
+    pub track_gain_db: Option<f64>,
+    pub album_gain_db: Option<f64>,
+    pub track_peak: Option<f64>,
+    pub album_peak: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Song {
     pub id: SongId,

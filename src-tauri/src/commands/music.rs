@@ -5,7 +5,7 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
-use std::{process::Command, sync::OnceLock};
+use std::{env, process::Command, sync::OnceLock};
 
 use solmusic_application::{
     domain::SongId, AudioQuality, CatalogFilter, QuickPickOptions, SunnySongApp,
@@ -16,8 +16,9 @@ use crate::{
     commands::library::proxy_artwork,
     dto::{
         ArtistPageDto, CatalogSearchResultsDto, DatabaseDiagnosticsDto, DeveloperDiagnosticsDto,
-        ListeningProfileDto, LyricsDto, PlaybackPreparationDto, PlaybackStateDto,
-        PlaybackSummaryDto, RecentSongsPageDto, RecommendationDto, SongDto,
+        DiscoverSectionDto, HistoryPageDto, ListeningProfileDto, ListeningRecapDto, LyricsDto,
+        PlaybackPreparationDto, PlaybackSourceDto, PlaybackStateDto, PlaybackSummaryDto,
+        RecentSongsPageDto, RecommendationDto, SongDto, SongsPageDto,
     },
     jellyfin::JellyfinService,
     local_library::read_embedded_lyrics,
@@ -60,13 +61,25 @@ fn ensure_audio_runtime() -> Result<(), String> {
     static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
     RESULT
         .get_or_init(|| {
-            let available = Command::new("gst-inspect-1.0")
+            let bundled_plugins_available = env::var_os("GST_PLUGIN_SYSTEM_PATH_1_0")
+                .is_some_and(|paths| {
+                    env::split_paths(&paths)
+                        .any(|path| path.join("libgstautodetect.so").is_file())
+                });
+            let system_plugins_available = Command::new("gst-inspect-1.0")
                 .arg("autoaudiosink")
                 .output()
                 .is_ok_and(|output| output.status.success());
-            available.then_some(()).ok_or_else(|| {
-                "Linux audio support is incomplete. Install the GStreamer good plugins (gst-plugins-good on Arch Linux) and restart SunnySong.".into()
-            })
+
+            (bundled_plugins_available || system_plugins_available)
+                .then_some(())
+                .ok_or_else(|| {
+                    if env::var_os("APPIMAGE").is_some() {
+                        "SunnySong's bundled Linux audio runtime is missing or damaged. Reinstall the app from a complete SunnySong package.".into()
+                    } else {
+                        "Linux audio support is incomplete. Install the GStreamer good plugins (gst-plugins-good on Arch Linux) and restart SunnySong.".into()
+                    }
+                })
         })
         .clone()
 }
@@ -168,10 +181,12 @@ pub async fn get_song_lyrics(
             tauri::async_runtime::spawn_blocking(move || read_embedded_lyrics(&local.path))
                 .await
                 .map_err(error)??;
-        return Ok(lyrics.map(|text| LyricsDto {
-            text,
+        return Ok(lyrics.map(|lyrics| LyricsDto {
+            text: lyrics.text,
+            lines: lyrics.lines.into_iter().map(Into::into).collect(),
+            synchronized: lyrics.synchronized,
             source: "embedded".into(),
-            attribution: None,
+            attribution: lyrics.attribution,
         }));
     }
     if song_id.as_str().starts_with("jellyfin:") {
@@ -182,6 +197,8 @@ pub async fn get_song_lyrics(
         .map(|lyrics| {
             lyrics.map(|lyrics| LyricsDto {
                 text: lyrics.text,
+                lines: lyrics.lines.into_iter().map(Into::into).collect(),
+                synchronized: lyrics.synchronized,
                 source: "youtube".into(),
                 attribution: lyrics.attribution,
             })
@@ -208,6 +225,31 @@ pub async fn warm_playback_source(
 ) -> Result<(), String> {
     let song_id = SongId::new(song_id).ok_or("song id cannot be blank")?;
     app.warm_playback_source(&song_id).await.map_err(error)
+}
+
+#[tauri::command]
+pub async fn prepare_next_playback_source(
+    app: State<'_, SunnySongApp>,
+    media_proxy: State<'_, Arc<MediaProxy>>,
+    song_id: String,
+) -> Result<PlaybackSourceDto, String> {
+    ensure_audio_runtime()?;
+    let song_id = SongId::new(song_id).ok_or("song id cannot be blank")?;
+    let source = app
+        .prepare_next_playback_source(&song_id)
+        .await
+        .map_err(error)?;
+    let local_path = source.local_path.clone();
+    let request_profile = source.request_profile;
+    let mut dto = source.into();
+    media_proxy.register_source(
+        &mut dto,
+        song_id.as_str(),
+        local_path,
+        request_profile,
+        false,
+    )?;
+    Ok(dto)
 }
 
 #[tauri::command]
@@ -265,6 +307,95 @@ fn proxy_preparation(
     media_proxy.register(&mut dto, local_path, request_profile, force_new_remote)?;
     proxy_state_artwork(&mut dto.state, jellyfin, media_proxy)?;
     Ok(dto)
+}
+
+fn proxied_state(
+    app: &SunnySongApp,
+    jellyfin: &JellyfinService,
+    media_proxy: &MediaProxy,
+    operation: impl FnOnce(
+        &SunnySongApp,
+    ) -> Result<
+        solmusic_application::PlaybackState,
+        solmusic_application::AppError,
+    >,
+) -> Result<PlaybackStateDto, String> {
+    let mut state: PlaybackStateDto = operation(app).map_err(error)?.into();
+    proxy_state_artwork(&mut state, jellyfin, media_proxy)?;
+    Ok(state)
+}
+
+#[tauri::command]
+pub fn enqueue_next(
+    app: State<'_, SunnySongApp>,
+    jellyfin: State<'_, Arc<JellyfinService>>,
+    media_proxy: State<'_, Arc<MediaProxy>>,
+    song: SongDto,
+) -> Result<PlaybackStateDto, String> {
+    let song = song.try_into()?;
+    proxied_state(&app, &jellyfin, &media_proxy, |app| app.enqueue_next(song))
+}
+
+#[tauri::command]
+pub fn enqueue_song(
+    app: State<'_, SunnySongApp>,
+    jellyfin: State<'_, Arc<JellyfinService>>,
+    media_proxy: State<'_, Arc<MediaProxy>>,
+    song: SongDto,
+) -> Result<PlaybackStateDto, String> {
+    let song = song.try_into()?;
+    proxied_state(&app, &jellyfin, &media_proxy, |app| app.enqueue_song(song))
+}
+
+#[tauri::command]
+pub fn remove_queue_item(
+    app: State<'_, SunnySongApp>,
+    jellyfin: State<'_, Arc<JellyfinService>>,
+    media_proxy: State<'_, Arc<MediaProxy>>,
+    index: usize,
+) -> Result<PlaybackStateDto, String> {
+    proxied_state(&app, &jellyfin, &media_proxy, |app| {
+        app.remove_queue_item(index)
+    })
+}
+
+#[tauri::command]
+pub fn move_queue_item(
+    app: State<'_, SunnySongApp>,
+    jellyfin: State<'_, Arc<JellyfinService>>,
+    media_proxy: State<'_, Arc<MediaProxy>>,
+    from_index: usize,
+    to_index: usize,
+) -> Result<PlaybackStateDto, String> {
+    proxied_state(&app, &jellyfin, &media_proxy, |app| {
+        app.move_queue_item(from_index, to_index)
+    })
+}
+
+#[tauri::command]
+pub fn clear_upcoming(
+    app: State<'_, SunnySongApp>,
+    jellyfin: State<'_, Arc<JellyfinService>>,
+    media_proxy: State<'_, Arc<MediaProxy>>,
+) -> Result<PlaybackStateDto, String> {
+    proxied_state(&app, &jellyfin, &media_proxy, SunnySongApp::clear_upcoming)
+}
+
+#[tauri::command]
+pub async fn replace_queue(
+    app: State<'_, SunnySongApp>,
+    jellyfin: State<'_, Arc<JellyfinService>>,
+    media_proxy: State<'_, Arc<MediaProxy>>,
+    songs: Vec<SongDto>,
+    start_index: usize,
+) -> Result<PlaybackPreparationDto, String> {
+    ensure_audio_runtime()?;
+    let songs = songs
+        .into_iter()
+        .map(TryInto::try_into)
+        .collect::<Result<Vec<_>, _>>()?;
+    let preparation = app.replace_queue(songs, start_index).await.map_err(error)?;
+    proxy_preparation(&media_proxy, &jellyfin, preparation, false)
 }
 
 #[tauri::command]
@@ -383,6 +514,124 @@ pub fn get_liked_song_ids(app: State<'_, SunnySongApp>) -> Result<Vec<String>, S
 }
 
 #[tauri::command]
+pub fn get_liked_songs(
+    app: State<'_, SunnySongApp>,
+    jellyfin: State<'_, Arc<JellyfinService>>,
+    media_proxy: State<'_, Arc<MediaProxy>>,
+    count: usize,
+    offset: usize,
+) -> Result<SongsPageDto, String> {
+    let count = count.clamp(1, 100);
+    let mut items = app.liked_songs(count + 1, offset).map_err(error)?;
+    let has_more = items.len() > count;
+    items.truncate(count);
+    let mut items = items.iter().map(SongDto::from).collect::<Vec<_>>();
+    for song in &mut items {
+        proxy_artwork(&mut song.thumbnail_url, &jellyfin, &media_proxy)?;
+    }
+    Ok(SongsPageDto {
+        items,
+        offset,
+        has_more,
+    })
+}
+
+#[tauri::command]
+pub fn get_history_events(
+    app: State<'_, SunnySongApp>,
+    jellyfin: State<'_, Arc<JellyfinService>>,
+    media_proxy: State<'_, Arc<MediaProxy>>,
+    count: usize,
+    before: Option<i64>,
+) -> Result<HistoryPageDto, String> {
+    let count = count.clamp(1, 100);
+    let mut items = app.history_events(count + 1, before).map_err(error)?;
+    let has_more = items.len() > count;
+    items.truncate(count);
+    let next_cursor = items.last().map(|item| item.sequence_id);
+    let mut items = items
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<crate::dto::HistoryEventDto>>();
+    for item in &mut items {
+        proxy_artwork(&mut item.song.thumbnail_url, &jellyfin, &media_proxy)?;
+    }
+    Ok(HistoryPageDto {
+        items,
+        next_cursor,
+        has_more,
+    })
+}
+
+#[tauri::command]
+pub fn delete_history_event(app: State<'_, SunnySongApp>, event_id: String) -> Result<(), String> {
+    app.delete_history_event(event_id.trim()).map_err(error)
+}
+
+#[tauri::command]
+pub fn delete_song_history(app: State<'_, SunnySongApp>, song_id: String) -> Result<u64, String> {
+    let song_id = SongId::new(song_id).ok_or("song id cannot be blank")?;
+    app.delete_song_history(&song_id).map_err(error)
+}
+
+#[tauri::command]
+pub fn clear_history(app: State<'_, SunnySongApp>) -> Result<u64, String> {
+    app.clear_history().map_err(error)
+}
+
+#[tauri::command]
+pub fn get_listening_recap(
+    app: State<'_, SunnySongApp>,
+    jellyfin: State<'_, Arc<JellyfinService>>,
+    media_proxy: State<'_, Arc<MediaProxy>>,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+    count: usize,
+) -> Result<ListeningRecapDto, String> {
+    let mut recap: ListeningRecapDto = app
+        .listening_recap(from_ms, to_ms, count.clamp(1, 50))
+        .map(Into::into)
+        .map_err(error)?;
+    for item in &mut recap.top_songs {
+        proxy_artwork(&mut item.song.thumbnail_url, &jellyfin, &media_proxy)?;
+    }
+    Ok(recap)
+}
+
+#[tauri::command]
+pub async fn get_search_suggestions(
+    app: State<'_, SunnySongApp>,
+    query: String,
+    count: usize,
+) -> Result<Vec<String>, String> {
+    app.search_suggestions(&query, count.clamp(1, 20))
+        .await
+        .map_err(error)
+}
+
+#[tauri::command]
+pub async fn get_discover_feed(
+    app: State<'_, SunnySongApp>,
+    jellyfin: State<'_, Arc<JellyfinService>>,
+    media_proxy: State<'_, Arc<MediaProxy>>,
+    count: usize,
+) -> Result<Vec<DiscoverSectionDto>, String> {
+    let mut sections = app
+        .discover_feed(count.clamp(1, 20), current_time_ms()?)
+        .await
+        .map_err(error)?
+        .into_iter()
+        .map(DiscoverSectionDto::from)
+        .collect::<Vec<_>>();
+    for section in &mut sections {
+        for item in &mut section.items {
+            proxy_artwork(&mut item.song.thumbnail_url, &jellyfin, &media_proxy)?;
+        }
+    }
+    Ok(sections)
+}
+
+#[tauri::command]
 pub fn report_playback(
     app: State<'_, SunnySongApp>,
     summary: PlaybackSummaryDto,
@@ -467,17 +716,23 @@ pub async fn get_quick_picks(
 #[tauri::command]
 pub async fn get_developer_diagnostics(
     app: State<'_, SunnySongApp>,
+    jellyfin: State<'_, Arc<JellyfinService>>,
+    media_proxy: State<'_, Arc<MediaProxy>>,
 ) -> Result<DeveloperDiagnosticsDto, String> {
     let now = current_time_ms()?;
     let database: DatabaseDiagnosticsDto = app.database_diagnostics().map_err(error)?.into();
-    let player: PlaybackStateDto = app.playback_state().into();
-    let recommendations: Vec<RecommendationDto> = app
+    let mut player: PlaybackStateDto = app.playback_state().into();
+    proxy_state_artwork(&mut player, &jellyfin, &media_proxy)?;
+    let mut recommendations: Vec<RecommendationDto> = app
         .quick_picks(20, now, &HashSet::new(), QuickPickOptions::default())
         .await
         .map_err(error)?
         .into_iter()
         .map(Into::into)
         .collect();
+    for item in &mut recommendations {
+        proxy_artwork(&mut item.song.thumbnail_url, &jellyfin, &media_proxy)?;
+    }
     Ok(DeveloperDiagnosticsDto {
         generated_at_ms: now,
         active_profile: app.active_listening_profile().map_err(error)?.into(),

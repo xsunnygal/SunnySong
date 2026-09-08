@@ -16,29 +16,36 @@ class ProfilesController {
 	error = $state<string | null>(null);
 	revision = $state(0);
 	private initialized = false;
+	private initializePromise: Promise<void> | null = null;
 
 	async initialize() {
 		if (this.initialized) return;
-		this.initialized = true;
+		if (this.initializePromise) return this.initializePromise;
 		this.loading = true;
 		this.error = null;
-		try {
-			const [items, active] = await Promise.all([
-				getListeningProfiles(),
-				getActiveListeningProfile(),
-			]);
-			this.items = items;
-			this.active = active;
-		} catch (error) {
-			this.initialized = false;
-			this.error = error instanceof Error ? error.message : String(error);
-			throw error;
-		} finally {
-			this.loading = false;
-		}
+		this.initializePromise = (async () => {
+			try {
+				const [items, active] = await Promise.all([
+					getListeningProfiles(),
+					getActiveListeningProfile(),
+				]);
+				this.items = items;
+				this.active = active;
+				this.initialized = true;
+			} catch (error) {
+				this.error = error instanceof Error ? error.message : String(error);
+				throw error;
+			} finally {
+				this.loading = false;
+				this.initializePromise = null;
+			}
+		})();
+		return this.initializePromise;
 	}
 
 	async create(name: string) {
+		if (this.changing)
+			throw new Error("Another profile change is already in progress");
 		this.changing = true;
 		this.error = null;
 		try {
@@ -54,11 +61,15 @@ class ProfilesController {
 	}
 
 	async rename(profileId: string, name: string) {
+		if (this.changing)
+			throw new Error("Another profile change is already in progress");
 		this.changing = true;
 		this.error = null;
 		try {
 			const profile = await renameListeningProfile(profileId, name);
-			this.items = this.items.map((item) => item.id === profileId ? profile : item);
+			this.items = this.items.map((item) =>
+				item.id === profileId ? profile : item,
+			);
 			if (this.active?.id === profileId) this.active = profile;
 			return profile;
 		} catch (error) {
@@ -71,12 +82,16 @@ class ProfilesController {
 
 	async select(profileId: string) {
 		if (this.active?.id === profileId) return this.active;
+		if (this.changing)
+			throw new Error("Another profile change is already in progress");
 		this.changing = true;
 		this.error = null;
 		try {
 			const profile = await setActiveListeningProfile(profileId);
 			this.active = profile;
-			this.items = this.items.map((item) => item.id === profileId ? profile : item);
+			this.items = this.items.map((item) =>
+				item.id === profileId ? profile : item,
+			);
 			this.revision += 1;
 			return profile;
 		} catch (error) {
@@ -88,6 +103,8 @@ class ProfilesController {
 	}
 
 	async remove(profileId: string) {
+		if (this.changing)
+			throw new Error("Another profile change is already in progress");
 		this.changing = true;
 		this.error = null;
 		try {

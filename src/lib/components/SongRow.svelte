@@ -7,6 +7,7 @@
 
   interface Props { song: Song; detail?: string; }
   let { song, detail }: Props = $props();
+  const visibleDetail = $derived(detail?.trim().toLocaleUpperCase() === "YT" ? undefined : detail);
 </script>
 
 <div class="song-row" role="group" aria-label={`${song.title} by ${song.artistName}`} onfocusin={() => player.preload(song)}>
@@ -14,7 +15,7 @@
     <button class="song-art-play" type="button" onclick={() => player.playSong(song)} aria-label={`Play ${song.title} by ${song.artistName}`}>
       {#if library.artwork(song)}<img src={library.artwork(song) ?? ""} alt="" loading="lazy" />{:else}<span class="fallback" aria-hidden="true">♫</span>{/if}
     </button>
-    <span class="song-copy"><button class="song-title" type="button" onclick={() => player.playSong(song)}>{song.title}</button><span><button class="artist-link" type="button" onclick={() => openSongArtist(song)}>{song.artistName}</button>{detail ? ` · ${detail}` : ""}</span></span>
+    <span class="song-copy"><button class="song-title" type="button" onclick={() => player.playSong(song)}>{song.title}</button><span><button class="artist-link" type="button" onclick={() => openSongArtist(song)}>{song.artistName}</button>{visibleDetail ? ` · ${visibleDetail}` : ""}</span></span>
   </div>
   <SongActionsMenu {song} compact />
   <button class="icon-button play-button" type="button" aria-label={`Play ${song.title}`} onclick={() => player.playSong(song)}>

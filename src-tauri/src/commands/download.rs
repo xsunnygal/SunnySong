@@ -14,7 +14,13 @@ use uuid::Uuid;
 
 #[cfg(desktop)]
 use crate::local_library::scan_directory;
-use crate::{dto::SongDto, local_library::LocalArtworkStore, media_proxy::MediaProxy};
+use crate::{
+    commands::library::proxy_artwork,
+    dto::{DownloadRecordDto, SongDto},
+    jellyfin::JellyfinService,
+    local_library::LocalArtworkStore,
+    media_proxy::MediaProxy,
+};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,6 +35,58 @@ pub async fn download_song(
     app: State<'_, SunnySongApp>,
     media_proxy: State<'_, std::sync::Arc<MediaProxy>>,
     artwork: State<'_, LocalArtworkStore>,
+    song: SongDto,
+    directory_id: Option<i64>,
+    android_tree_uri: Option<String>,
+) -> Result<DownloadResultDto, String> {
+    let domain_song: solmusic_application::domain::Song = song.clone().try_into()?;
+    let attempt = app
+        .create_download_attempt(&domain_song, current_time_ms())
+        .map_err(|error| error.to_string())?;
+    let result = download_song_inner(
+        app_handle,
+        app.inner(),
+        media_proxy.inner(),
+        artwork.inner(),
+        song,
+        directory_id,
+        android_tree_uri,
+    )
+    .await;
+    match &result {
+        Ok(completed) => {
+            if let Err(error) = app.finish_download_attempt(
+                &attempt.id,
+                "completed",
+                Some(&completed.location),
+                Some(&completed.file_name),
+                None,
+                current_time_ms(),
+            ) {
+                tracing::error!(category = "DOWNLOAD", event = "download_registry_finalize_failed", download_id = attempt.id, location = completed.location, reason = %error);
+            }
+        }
+        Err(message) => {
+            if let Err(error) = app.finish_download_attempt(
+                &attempt.id,
+                "failed",
+                None,
+                None,
+                Some(message),
+                current_time_ms(),
+            ) {
+                tracing::warn!(category = "DOWNLOAD", event = "download_registry_finalize_failed", download_id = attempt.id, reason = %error);
+            }
+        }
+    }
+    result
+}
+
+async fn download_song_inner(
+    app_handle: AppHandle,
+    app: &SunnySongApp,
+    media_proxy: &std::sync::Arc<MediaProxy>,
+    artwork: &LocalArtworkStore,
     song: SongDto,
     directory_id: Option<i64>,
     android_tree_uri: Option<String>,
@@ -117,10 +175,19 @@ pub async fn download_song(
             }
             let _ = tokio::fs::remove_file(&temporary_path).await;
         }
+        let previous = match app.local_scan_state(directory.id) {
+            Ok(previous) => previous,
+            Err(error) => {
+                tracing::warn!(category = "DOWNLOAD", event = "download_scan_state_failed", directory_id = directory.id, reason = %error);
+                Vec::new()
+            }
+        };
         let scan_target = directory.clone();
-        let artwork = artwork.inner().clone();
-        match tauri::async_runtime::spawn_blocking(move || scan_directory(&scan_target, &artwork))
-            .await
+        let artwork_store = artwork.clone();
+        match tauri::async_runtime::spawn_blocking(move || {
+            scan_directory(&scan_target, &artwork_store, &previous)
+        })
+        .await
         {
             Ok(Ok(batch)) => {
                 if let Err(error) = app.store_directory_scan(
@@ -189,7 +256,68 @@ pub async fn pick_android_download_directory() -> Result<serde_json::Value, Stri
     Err("Android storage selection is only available on Android".into())
 }
 
-#[cfg(desktop)]
+#[tauri::command]
+pub fn get_downloads(
+    app: State<'_, SunnySongApp>,
+    jellyfin: State<'_, std::sync::Arc<JellyfinService>>,
+    media_proxy: State<'_, std::sync::Arc<MediaProxy>>,
+    count: usize,
+    offset: usize,
+) -> Result<Vec<DownloadRecordDto>, String> {
+    let mut items = app
+        .downloads(count.clamp(1, 100), offset)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<DownloadRecordDto>>();
+    for item in &mut items {
+        proxy_artwork(&mut item.song.thumbnail_url, &jellyfin, &media_proxy)?;
+    }
+    Ok(items)
+}
+
+#[tauri::command]
+pub fn remove_download(
+    app: State<'_, SunnySongApp>,
+    download_id: String,
+    delete_file: bool,
+) -> Result<(), String> {
+    if delete_file {
+        #[cfg(mobile)]
+        return Err("deleting a published Android document is not safely supported".into());
+        #[cfg(desktop)]
+        {
+            let record = app
+                .downloads(10_000, 0)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|item| item.id == download_id)
+                .ok_or("download registry entry was not found")?;
+            let location = record
+                .location
+                .ok_or("download has no completed local file")?;
+            let path = PathBuf::from(location)
+                .canonicalize()
+                .map_err(|error| format!("download file is unavailable: {error}"))?;
+            let inside_music_root = app
+                .music_directories()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .filter_map(|directory| PathBuf::from(directory.path).canonicalize().ok())
+                .any(|root| path.starts_with(root));
+            if !inside_music_root || !path.is_file() {
+                return Err("refusing to delete a file outside configured music folders".into());
+            }
+            std::fs::remove_file(&path)
+                .map_err(|error| format!("could not delete downloaded file: {error}"))?;
+            app.mark_local_file_missing(&path.to_string_lossy(), current_time_ms())
+                .map_err(|error| format!("downloaded file was deleted but the library index could not be reconciled: {error}"))?;
+        }
+    }
+    app.remove_download(&download_id)
+        .map_err(|error| error.to_string())
+}
+
 fn current_time_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -1,15 +1,36 @@
 use serde::{Deserialize, Serialize};
 use solmusic_application::{
     domain::{ArtistRef, ListeningSummary, PlaybackEndReason, Song, SongId},
-    ArtistPage, CatalogArtist, CatalogCollection, CatalogSearchResults, LibraryAlbum,
-    LibraryFolder, LibrarySource, LibraryTrack, ListeningProfile, PlaybackPreparation,
-    PlaybackState, Playlist, PlaylistTrack, RecommendedSong,
+    ArtistPage, CatalogArtist, CatalogCollection, CatalogSearchResults, DiscoverSection,
+    DownloadRecord, HistoryEvent, LibraryAlbum, LibraryFolder, LibrarySource, LibraryTrack,
+    ListeningProfile, ListeningRecap, PlaybackPreparation, PlaybackSource, PlaybackState, Playlist,
+    PlaylistTrack, RecommendedSong, TimedLyricsLine,
 };
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimedLyricsLineDto {
+    pub start_ms: u64,
+    pub end_ms: Option<u64>,
+    pub text: String,
+}
+
+impl From<TimedLyricsLine> for TimedLyricsLineDto {
+    fn from(value: TimedLyricsLine) -> Self {
+        Self {
+            start_ms: value.start_ms,
+            end_ms: value.end_ms,
+            text: value.text,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LyricsDto {
     pub text: String,
+    pub lines: Vec<TimedLyricsLineDto>,
+    pub synchronized: bool,
     pub source: String,
     pub attribution: Option<String>,
 }
@@ -286,10 +307,42 @@ impl TryFrom<SongDto> for Song {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct NormalizationGainMetadataDto {
+    pub track_gain_db: Option<f64>,
+    pub album_gain_db: Option<f64>,
+    pub track_peak: Option<f64>,
+    pub album_peak: Option<f64>,
+}
+
+impl From<solmusic_application::NormalizationGainMetadata> for NormalizationGainMetadataDto {
+    fn from(value: solmusic_application::NormalizationGainMetadata) -> Self {
+        Self {
+            track_gain_db: value.track_gain_db,
+            album_gain_db: value.album_gain_db,
+            track_peak: value.track_peak,
+            album_peak: value.album_peak,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PlaybackSourceDto {
     pub url: String,
     pub mime_type: String,
     pub expires_at_ms: Option<i64>,
+    pub normalization_gain_metadata: Option<NormalizationGainMetadataDto>,
+}
+
+impl From<PlaybackSource> for PlaybackSourceDto {
+    fn from(value: PlaybackSource) -> Self {
+        Self {
+            url: value.url,
+            mime_type: value.mime_type,
+            expires_at_ms: value.expires_at_ms,
+            normalization_gain_metadata: value.normalization_gain_metadata.map(Into::into),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -320,11 +373,7 @@ pub struct PlaybackPreparationDto {
 impl From<PlaybackPreparation> for PlaybackPreparationDto {
     fn from(value: PlaybackPreparation) -> Self {
         Self {
-            source: PlaybackSourceDto {
-                url: value.source.url,
-                mime_type: value.source.mime_type,
-                expires_at_ms: value.source.expires_at_ms,
-            },
+            source: value.source.into(),
             state: value.state.into(),
         }
     }
@@ -429,6 +478,182 @@ pub struct RecentSongsPageDto {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SongsPageDto {
+    pub items: Vec<SongDto>,
+    pub offset: usize,
+    pub has_more: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryEventDto {
+    pub sequence_id: i64,
+    pub event_id: String,
+    pub song: SongDto,
+    pub started_at_ms: i64,
+    pub listened_ms: u64,
+    pub duration_ms: Option<u64>,
+    pub reason: String,
+}
+
+impl From<HistoryEvent> for HistoryEventDto {
+    fn from(value: HistoryEvent) -> Self {
+        Self {
+            sequence_id: value.sequence_id,
+            event_id: value.event_id,
+            song: SongDto::from(&value.song),
+            started_at_ms: value.started_at_ms,
+            listened_ms: value.listened_ms,
+            duration_ms: value.duration_ms,
+            reason: value.reason,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryPageDto {
+    pub items: Vec<HistoryEventDto>,
+    pub next_cursor: Option<i64>,
+    pub has_more: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListeningRecapDto {
+    pub total_listened_ms: u64,
+    pub plays: u64,
+    pub completions: u64,
+    pub skips: u64,
+    pub unique_songs: u64,
+    pub unique_artists: u64,
+    pub top_songs: Vec<RecapSongDto>,
+    pub top_artists: Vec<RecapArtistDto>,
+    pub coverage: RecapCoverageDto,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecapSongDto {
+    pub song: SongDto,
+    pub listened_ms: u64,
+    pub plays: u64,
+    pub completions: u64,
+    pub skips: u64,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecapArtistDto {
+    pub artist_id: Option<String>,
+    pub artist_name: String,
+    pub listened_ms: u64,
+    pub plays: u64,
+    pub completions: u64,
+    pub skips: u64,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecapCoverageDto {
+    pub requested_from_ms: Option<i64>,
+    pub requested_to_ms: Option<i64>,
+    pub available_from_ms: Option<i64>,
+    pub complete_from_ms: i64,
+    pub complete: bool,
+    pub note: String,
+}
+
+impl From<ListeningRecap> for ListeningRecapDto {
+    fn from(value: ListeningRecap) -> Self {
+        Self {
+            total_listened_ms: value.total_listened_ms,
+            plays: value.plays,
+            completions: value.completions,
+            skips: value.skips,
+            unique_songs: value.unique_songs,
+            unique_artists: value.unique_artists,
+            top_songs: value
+                .top_songs
+                .into_iter()
+                .map(|item| RecapSongDto {
+                    song: SongDto::from(&item.song),
+                    listened_ms: item.listened_ms,
+                    plays: item.plays,
+                    completions: item.completions,
+                    skips: item.skips,
+                })
+                .collect(),
+            top_artists: value
+                .top_artists
+                .into_iter()
+                .map(|item| RecapArtistDto {
+                    artist_id: item.artist_id,
+                    artist_name: item.artist_name,
+                    listened_ms: item.listened_ms,
+                    plays: item.plays,
+                    completions: item.completions,
+                    skips: item.skips,
+                })
+                .collect(),
+            coverage: RecapCoverageDto {
+                requested_from_ms: value.coverage.requested_from_ms,
+                requested_to_ms: value.coverage.requested_to_ms,
+                available_from_ms: value.coverage.available_from_ms,
+                complete_from_ms: value.coverage.complete_from_ms,
+                complete: value.coverage.complete,
+                note: value.coverage.note,
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadRecordDto {
+    pub id: String,
+    pub song: SongDto,
+    pub status: String,
+    pub location: Option<String>,
+    pub file_name: Option<String>,
+    pub error: Option<String>,
+    pub created_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+}
+impl From<DownloadRecord> for DownloadRecordDto {
+    fn from(value: DownloadRecord) -> Self {
+        Self {
+            id: value.id,
+            song: SongDto::from(&value.song),
+            status: value.status,
+            location: value.location,
+            file_name: value.file_name,
+            error: value.error,
+            created_at_ms: value.created_at_ms,
+            completed_at_ms: value.completed_at_ms,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoverSectionDto {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub items: Vec<RecommendationDto>,
+}
+impl From<DiscoverSection> for DiscoverSectionDto {
+    fn from(value: DiscoverSection) -> Self {
+        Self {
+            id: value.id,
+            title: value.title,
+            description: value.description,
+            items: value.items.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ScoreComponentDto {
     pub name: String,
     pub raw_value: f64,
@@ -500,6 +725,7 @@ pub struct LibraryScanResultDto {
     pub directory_id: i64,
     pub status: String,
     pub indexed_tracks: usize,
+    pub unchanged_tracks: usize,
     pub unavailable_tracks: usize,
     pub skipped_files: usize,
     pub duration_ms: u64,
@@ -512,6 +738,7 @@ impl From<solmusic_application::LibraryScanResult> for LibraryScanResultDto {
             directory_id: value.directory_id,
             status: value.status,
             indexed_tracks: value.indexed_tracks,
+            unchanged_tracks: value.unchanged_tracks,
             unavailable_tracks: value.unavailable_tracks,
             skipped_files: value.skipped_files,
             duration_ms: value.duration_ms,

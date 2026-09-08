@@ -1,67 +1,61 @@
 # SunnySong roadmap
 
-This is the working sequence for the MVP. Each phase should leave the app runnable and keep unstable integrations behind ports.
+SunnySong has moved beyond the original foundation milestones. This document separates functionality present in the current working tree from release work that still requires implementation or hands-on platform validation.
 
-## 0. Foundation — current
+## Implemented in the current working tree
 
-- Establish the Rust workspace and dependency boundaries.
-- Establish feature-oriented Svelte modules and one typed Tauri API boundary.
-- Validate desktop and Android builds in CI-friendly form.
-- Record architectural decisions before adding difficult integrations.
+### Core architecture and playback
 
-## 1. Search and provider
+- Rust workspace boundaries, typed Tauri commands, SQLite migrations, and provider/playback ports are established.
+- Local files, Jellyfin libraries, and optional YouTube Music search and playback share normalized song and collection models.
+- Queue persistence, play next, queue editing, shuffle, repeat-one, seek, volume, buffered playback recovery, lyrics, and sleep timer controls are implemented.
+- Playback and listening events feed profile-scoped history, likes, affinity, skips, completions, Recently Played, Next Up, and Quick Picks.
 
-- Define canonical song, artist, album, search, and playback-source models.
-- Define the `MusicProvider` port in the application layer.
-- Implement YouTube Music search and metadata behind a dedicated adapter.
-- Add caching, timeouts, structured errors, and provider diagnostics.
+### Discovery and library
 
-Milestone: search for a song and display normalized results.
+- Search includes local and online songs, artists, albums, playlists, suggestions, artist pages, and collection playback, with partial-result handling.
+- Home provides bounded, paged Quick Picks and paged Recently Played results with configurable diversity, new-song, and rediscovery inputs.
+- Discover provides profile-aware recommendation sections and continues to support local recommendations when online Discovery is disabled.
+- Library browsing covers songs, albums, folders, Jellyfin sources, playlists, bulk song actions, and explicit user-driven pagination for large lists.
+- Dedicated Liked Songs, History, Downloads, and listening Recap pages are implemented with profile-aware refreshes and bounded loading.
+- Local playlists support create, rename, delete, reorder, bulk additions/removals, and desktop M3U/M3U8 import/export.
+- Downloads track attempts and failures, support retry/removal, write metadata, and use Android Storage Access Framework destinations where applicable.
+- Desktop backup export and validated, restart-gated restore staging are implemented; credentials and YouTube cookies remain outside backups.
 
-## 2. Playback foundation
+### Platform integration present in the tree
 
-- Define player commands/events and a single authoritative playback state.
-- Implement a desktop audio adapter.
-- Implement Android Media3 playback through a narrow Kotlin/Tauri bridge.
-- Add play, pause, seek, volume, next/previous, audio focus, and media metadata.
+- Android has a foreground playback service, MediaSession controls, notification metadata/artwork, and persisted browse snapshots.
+- Linux has an MPRIS implementation and AppImage configuration for bundling the required GStreamer runtime.
+- Responsive layouts, reduced-motion support, keyboard/accessibility labels, live loading/error announcements, explicit retries, and empty/partial-failure states have received an initial pass.
 
-Milestone: search → select → reliable foreground/background playback.
+## Remaining platform and release work
 
-## 3. Persistence and listening signals
+### Platform completion
 
-- Add versioned SQLite migrations and repository adapters.
-- Store song cache, settings, track/artist aggregates, and bounded recent plays.
-- Track sessions in memory and commit one summary when playback ends/interruption occurs.
-- Add likes, dislikes, completion, early-skip, replay, and crash-safe checkpoints.
+- Validate Android foreground/background playback, media controls, process recreation, audio focus, storage permissions, and downloaded-file playback on representative physical devices and supported Android versions.
+- Validate packaged AppImage playback on clean Linux distributions, including bundled GStreamer codecs, local/Jellyfin/YouTube sources, MPRIS controls, and update/install behavior.
+- Implement and validate Windows SMTC and macOS Now Playing integrations before describing those platforms as supported.
+- Add Android-compatible backup import/export through content URIs if backup parity is required on mobile.
+- Continue accessibility testing with keyboard-only navigation, screen readers, text scaling, contrast modes, and mobile touch targets.
 
-Milestone: behavior produces explainable, tested local aggregates.
+### Reliability and performance
 
-## 4. Next Up
+- Expand failure-injection coverage for offline transitions, provider timeouts, stale requests, interrupted downloads, database restore failures, and queue recovery.
+- Profile large libraries and long histories on lower-end Android hardware; tune query, artwork, and list rendering costs where measurements justify it.
+- Continue recommendation tuning from real listening data while keeping score inputs and exclusion reasons explainable.
+- Define retention and cleanup behavior for download records, cached provider metadata, artwork, and diagnostic data.
 
-- Retrieve provider-related tracks when playback starts.
-- Rank primarily by current-song relationship.
-- Deduplicate, enforce session/artist diversity, and refill near queue end.
-- Expose queue reasons in developer diagnostics.
+### Release engineering
 
-Milestone: continuous listening with a coherent 10–20 item queue.
+- Add reproducible CI builds for Linux, Windows, macOS, APK, and AAB, with version checks and artifact retention.
+- Add signing, notarization, Android keystore handling, release-channel configuration, checksums, and rollback documentation.
+- Run a manual release matrix for install, upgrade, migration, backup/restore, offline startup, playback, background controls, and uninstall/reinstall behavior.
+- Document supported operating-system versions, codec limitations, Jellyfin compatibility, YouTube authentication caveats, and privacy expectations.
 
-## 5. Quick Picks
+Automated Rust tests cover core application and persistence behavior, and frontend static checks are available through `npm run check`. There are currently no automated Android-device or packaged-AppImage playback tests; those scenarios remain explicit manual release gates.
 
-- Generate a bounded pool from favorites, recent interests, related tracks, rediscovery, and exploration.
-- Score track affinity, artist affinity, recency, completion, discovery, repetition, and skips.
-- Save stable recommendation snapshots and score explanations.
-- Tune from real listening without introducing opaque ML.
-
-Milestone: recommendations become noticeably personal after roughly 20 meaningful plays.
-
-## 6. Platform polish and releases
-
-- Linux MPRIS, Windows SMTC, macOS Now Playing, and Android MediaSession/notification integration.
-- Responsive desktop/mobile UX, accessibility, offline/error states, and performance passes.
-- CI builds for Linux, Windows, macOS, APK, and AAB.
-
-## 7. Optional sync
+## Optional sync — future
 
 - Build an Axum service separately from the client and YouTube request path.
 - Sync UUIDv7 listening summaries and explicit actions idempotently.
-- Rebuild aggregates locally; never synchronize stream URLs or proxy media.
+- Rebuild aggregates locally; never synchronize stream URLs, credentials, cookies, or proxied media.

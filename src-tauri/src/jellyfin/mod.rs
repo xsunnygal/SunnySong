@@ -456,6 +456,7 @@ impl JellyfinService {
             expires_at_ms: None,
             local_path: None,
             request_profile: solmusic_application::PlaybackRequestProfile::Web,
+            normalization_gain_metadata: None,
         })
     }
 

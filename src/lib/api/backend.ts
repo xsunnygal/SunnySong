@@ -26,6 +26,28 @@ export interface PlaylistTrack {
 	position: number;
 	addedAtMs: number;
 }
+export interface BackupStatus {
+	path: string;
+	restartRequired: boolean;
+	message: string;
+}
+export interface PlaylistExportStatus {
+	path: string;
+	exported: number;
+	portable: number;
+	preservedAsMetadata: number;
+}
+export interface PlaylistImportReason {
+	reason: string;
+	count: number;
+}
+export interface PlaylistImportStatus {
+	playlistId: string;
+	playlistName: string;
+	imported: number;
+	skipped: number;
+	reasons: PlaylistImportReason[];
+}
 export interface Song {
 	id: string;
 	title: string;
@@ -78,15 +100,29 @@ export interface DownloadResult {
 	location: string;
 	fileName: string;
 }
+export interface TimedLyricsLine {
+	startMs: number;
+	endMs: number | null;
+	text: string;
+}
 export interface SongLyrics {
 	text: string;
+	lines: TimedLyricsLine[];
+	synchronized: boolean;
 	source: "embedded" | "youtube";
 	attribution: string | null;
+}
+export interface NormalizationGainMetadata {
+	trackGainDb: number | null;
+	albumGainDb: number | null;
+	trackPeak: number | null;
+	albumPeak: number | null;
 }
 export interface PlaybackSource {
 	url: string;
 	mimeType: string;
 	expiresAtMs: number | null;
+	normalizationGainMetadata: NormalizationGainMetadata | null;
 }
 export interface PlaybackState {
 	current: Song | null;
@@ -102,6 +138,14 @@ export interface PlaybackPreparation {
 	source: PlaybackSource;
 	state: PlaybackState;
 }
+export interface MediaSessionItem {
+	id: string;
+	title: string;
+	artist: string;
+	album: string | null;
+	artworkUrl: string | null;
+	durationMs: number;
+}
 export interface MediaSessionUpdate {
 	active: boolean;
 	title: string;
@@ -113,6 +157,9 @@ export interface MediaSessionUpdate {
 	durationMs: number;
 	canGoPrevious: boolean;
 	canGoNext: boolean;
+	queue: MediaSessionItem[];
+	currentItem: MediaSessionItem | null;
+	currentIndex: number | null;
 }
 export interface PlaybackSummary {
 	eventId: string;
@@ -229,6 +276,7 @@ export interface LibraryScanResult {
 	directoryId: number;
 	status: string;
 	indexedTracks: number;
+	unchangedTracks: number;
 	unavailableTracks: number;
 	skippedFiles: number;
 	durationMs: number;
@@ -238,6 +286,75 @@ export interface RecentSongsPage {
 	items: Song[];
 	nextCursor: number | null;
 	hasMore: boolean;
+}
+export interface SongsPage {
+	items: Song[];
+	offset: number;
+	hasMore: boolean;
+}
+export interface HistoryEvent {
+	sequenceId: number;
+	eventId: string;
+	song: Song;
+	startedAtMs: number;
+	listenedMs: number;
+	durationMs: number | null;
+	reason: PlaybackSummary["reason"];
+}
+export interface HistoryPage {
+	items: HistoryEvent[];
+	nextCursor: number | null;
+	hasMore: boolean;
+}
+export interface RecapSong {
+	song: Song;
+	listenedMs: number;
+	plays: number;
+	completions: number;
+	skips: number;
+}
+export interface RecapArtist {
+	artistId: string | null;
+	artistName: string;
+	listenedMs: number;
+	plays: number;
+	completions: number;
+	skips: number;
+}
+export interface RecapCoverage {
+	requestedFromMs: number | null;
+	requestedToMs: number | null;
+	availableFromMs: number | null;
+	completeFromMs: number;
+	complete: boolean;
+	note: string;
+}
+export interface ListeningRecap {
+	totalListenedMs: number;
+	plays: number;
+	completions: number;
+	skips: number;
+	uniqueSongs: number;
+	uniqueArtists: number;
+	topSongs: RecapSong[];
+	topArtists: RecapArtist[];
+	coverage: RecapCoverage;
+}
+export interface DownloadRecord {
+	id: string;
+	song: Song;
+	status: "pending" | "completed" | "failed" | string;
+	location: string | null;
+	fileName: string | null;
+	error: string | null;
+	createdAtMs: number;
+	completedAtMs: number | null;
+}
+export interface DiscoverSection {
+	id: string;
+	title: string;
+	description: string;
+	items: Recommendation[];
 }
 
 export const getAppStatus = () => invoke<AppStatus>("get_app_status");
@@ -251,6 +368,22 @@ export const getPlaylistTracks = (playlistId: string) =>
 	invoke<PlaylistTrack[]>("get_playlist_tracks", { playlistId });
 export const addSongToPlaylist = (playlistId: string, song: Song) =>
 	invoke<PlaylistTrack>("add_song_to_playlist", { playlistId, song });
+export const renamePlaylist = (playlistId: string, name: string) =>
+	invoke<Playlist>("rename_playlist", { playlistId, name });
+export const deletePlaylist = (playlistId: string) =>
+	invoke<void>("delete_playlist", { playlistId });
+export const removeSongFromPlaylist = (playlistId: string, songId: string) =>
+	invoke<void>("remove_song_from_playlist", { playlistId, songId });
+export const reorderPlaylistTracks = (playlistId: string, songIds: string[]) =>
+	invoke<PlaylistTrack[]>("reorder_playlist_tracks", { playlistId, songIds });
+export const exportPlaylistM3u = (playlistId: string, path: string) =>
+	invoke<PlaylistExportStatus>("export_playlist_m3u", { playlistId, path });
+export const importPlaylistM3u = (path: string, name: string) =>
+	invoke<PlaylistImportStatus>("import_playlist_m3u", { path, name });
+export const exportBackup = (path: string) =>
+	invoke<BackupStatus>("export_backup", { path });
+export const stageBackupRestore = (path: string) =>
+	invoke<BackupStatus>("stage_backup_restore", { path });
 export const searchLocalMusic = (query: string) =>
 	invoke<Song[]>("search_local_music", { query });
 export const getLibraryTracks = (count = 12, offset = 0) =>
@@ -338,6 +471,10 @@ export const downloadSong = (
 		directoryId,
 		androidTreeUri,
 	});
+export const getDownloads = (count = 50, offset = 0) =>
+	invoke<DownloadRecord[]>("get_downloads", { count, offset });
+export const removeDownload = (downloadId: string, deleteFile = false) =>
+	invoke<void>("remove_download", { downloadId, deleteFile });
 export const pickAndroidDownloadDirectory = () =>
 	invoke<AndroidStorageDirectory>("pick_android_download_directory");
 export const backgroundApp = () => invoke<void>("background_app");
@@ -345,12 +482,25 @@ export const getSongLyrics = (songId: string) =>
 	invoke<SongLyrics | null>("get_song_lyrics", { songId });
 export const preparePlayback = (song: Song) =>
 	invoke<PlaybackPreparation>("prepare_playback", { song });
+export const prepareNextPlaybackSource = (songId: string) =>
+	invoke<PlaybackSource>("prepare_next_playback_source", { songId });
 export const warmPlaybackSource = (songId: string) =>
 	invoke<void>("warm_playback_source", { songId });
 export const hydratePlaybackQueue = (songId: string) =>
 	invoke<PlaybackState>("hydrate_playback_queue", { songId });
 export const refillPlaybackQueue = (count: number) =>
 	invoke<PlaybackState>("refill_playback_queue", { count });
+export const enqueueNext = (song: Song) =>
+	invoke<PlaybackState>("enqueue_next", { song });
+export const enqueueSong = (song: Song) =>
+	invoke<PlaybackState>("enqueue_song", { song });
+export const removeQueueItem = (index: number) =>
+	invoke<PlaybackState>("remove_queue_item", { index });
+export const moveQueueItem = (fromIndex: number, toIndex: number) =>
+	invoke<PlaybackState>("move_queue_item", { fromIndex, toIndex });
+export const clearUpcoming = () => invoke<PlaybackState>("clear_upcoming");
+export const replaceQueue = (songs: Song[], startIndex = 0) =>
+	invoke<PlaybackPreparation>("replace_queue", { songs, startIndex });
 export const playNext = () => invoke<PlaybackPreparation>("play_next");
 export const playQueueItem = (songId: string) =>
 	invoke<PlaybackPreparation>("play_queue_item", { songId });
@@ -372,6 +522,24 @@ export const deleteListeningProfile = (profileId: string) =>
 export const setActiveListeningProfile = (profileId: string) =>
 	invoke<ListeningProfile>("set_active_listening_profile", { profileId });
 export const getLikedSongIds = () => invoke<string[]>("get_liked_song_ids");
+export const getLikedSongs = (count = 50, offset = 0) =>
+	invoke<SongsPage>("get_liked_songs", { count, offset });
+export const getHistoryEvents = (count = 50, before: number | null = null) =>
+	invoke<HistoryPage>("get_history_events", { count, before });
+export const deleteHistoryEvent = (eventId: string) =>
+	invoke<void>("delete_history_event", { eventId });
+export const deleteSongHistory = (songId: string) =>
+	invoke<number>("delete_song_history", { songId });
+export const clearHistory = () => invoke<number>("clear_history");
+export const getListeningRecap = (
+	fromMs: number | null = null,
+	toMs: number | null = null,
+	count = 10,
+) => invoke<ListeningRecap>("get_listening_recap", { fromMs, toMs, count });
+export const getSearchSuggestions = (query: string, count = 8) =>
+	invoke<string[]>("get_search_suggestions", { query, count });
+export const getDiscoverFeed = (count = 10) =>
+	invoke<DiscoverSection[]>("get_discover_feed", { count });
 export const reportPlayback = (summary: PlaybackSummary) =>
 	invoke<void>("report_playback", { summary });
 export const syncMediaSession = (update: MediaSessionUpdate) =>

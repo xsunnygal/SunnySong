@@ -12,6 +12,7 @@ node_modules
 !.env.example
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+/NOTES.md
 
 # Local release artifacts and generated verification captures
 /artifacts/

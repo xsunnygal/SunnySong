@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { getAppStatus } from "$lib/api/backend";
 
-  let version = $state("0.3.1");
+  let version = $state("0.4.2");
 
   onMount(() => {
     void getAppStatus().then((status) => version = status.version).catch(() => {});
@@ -13,6 +13,31 @@
 
 <header class="simple-page-header"><a class="icon-button" href="#/" aria-label="Back to Home">←</a><div><h1>About SunnySong</h1><p>Version {version}</p></div></header>
 <main class="about-page">
+  <section class="settings-group">
+    <div><h2>0.4.2</h2><p>Focused navigation and interface polish</p></div>
+    <ul class="changelog-list">
+      <li>Moved personalized Discover sections onto Home beneath Quick Picks and added wheel and trackpad paging.</li>
+      <li>Simplified navigation, page headings, song metadata, and Settings by removing unused or redundant controls and descriptions.</li>
+      <li>Improved recent-history navigation, volume and normalization controls, centered secondary page headers, and Android launcher icon spacing.</li>
+    </ul>
+  </section>
+  <section class="settings-group">
+    <div><h2>0.4.1</h2><p>Audio reliability and cleaner recommendations</p></div>
+    <ul class="changelog-list">
+      <li>Fixed silent playback on Linux and Android by keeping proxied audio out of WebKit's cross-origin Web Audio graph.</li>
+      <li>Crossfade, sleep fades, and ReplayGain attenuation now use reliable native media-element volume controls.</li>
+      <li>Quick Picks and automatic Next Up queues now keep only the highest-scored upload when an artist has duplicate, remix, remaster, or equivalent song variants.</li>
+    </ul>
+  </section>
+  <section class="settings-group">
+    <div><h2>0.4.0</h2><p>Discovery, library, and listening update</p></div>
+    <ul class="changelog-list">
+      <li>Added Discover, improved live search, artist and collection browsing, personalized Quick Picks, and smarter continuous queues.</li>
+      <li>Added synced follow-along lyrics, per-song timing adjustment, Play Next, persistent queues, gapless preloading, crossfade, sleep timers, and ReplayGain/R128 normalization.</li>
+      <li>Expanded the local-first Library with dependable cover art, incremental scans, Jellyfin, automatic collections, playlists, downloads, bulk actions, M3U import/export, profiles, likes, history, and Recap.</li>
+      <li>Added Android media controls and Android Auto browsing, Linux MPRIS integration, keyboard shortcuts, desktop backup/restore, clearer offline states, and bundled Linux audio codecs.</li>
+    </ul>
+  </section>
   <section class="settings-group">
     <div><h2>0.3.1</h2><p>SunnySong rename</p></div>
     <ul class="changelog-list">

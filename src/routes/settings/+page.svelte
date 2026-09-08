@@ -1,23 +1,25 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { open as openDialog } from "@tauri-apps/plugin-dialog";
+  import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
   import {
     addMusicDirectory,
     beginJellyfinQuickConnect,
-    clearYouTubeAuth,
+
     connectJellyfinPassword,
+    exportBackup,
     finishJellyfinQuickConnect,
     getJellyfinServers,
     getLocalArtists,
     getMusicDirectories,
-    getYouTubeAuthStatus,
+
     refreshJellyfinLibraries,
     removeJellyfinServer,
     removeMusicDirectory,
     rescanMusicLibrary,
     setJellyfinLibraryEnabled,
     setLocalArtistEnabled,
-    setYouTubeCookies,
+
+    stageBackupRestore,
     validateJellyfinServer,
     type AudioQuality,
     type JellyfinPublicServerInfo,
@@ -25,10 +27,12 @@
     type JellyfinServer,
     type LocalArtist,
     type MusicDirectory,
-    type YouTubeAuthStatus,
+
   } from "$lib/api/backend";
   import { library } from "$lib/features/library/library.svelte";
   import { motion } from "$lib/features/motion/motion.svelte";
+  import { player } from "$lib/features/player/player.svelte";
+  import { revisions } from "$lib/features/revisions.svelte";
   import { theme, type ThemePreference } from "$lib/features/theme/theme.svelte";
 
   const options: { value: ThemePreference; label: string }[] = [
@@ -57,38 +61,11 @@
   let artistHasMore = $state(false);
   let busy = $state(false);
   let message = $state("");
-  let youtubeAuth = $state<YouTubeAuthStatus>({ configured: false });
-  let youtubeCookies = $state("");
-  let youtubeAuthBusy = $state(false);
-  let youtubeAuthMessage = $state("");
   let searchTimer: ReturnType<typeof setTimeout>;
-
-  async function saveYouTubeCookies() {
-    youtubeAuthBusy = true;
-    youtubeAuthMessage = "Saving account session securely…";
-    try {
-      youtubeAuth = await setYouTubeCookies(youtubeCookies);
-      youtubeAuthMessage = "YouTube Music session saved. Verification-required playback can now retry with it.";
-    } catch (error) {
-      youtubeAuthMessage = error instanceof Error ? error.message : String(error);
-    } finally {
-      youtubeCookies = "";
-      youtubeAuthBusy = false;
-    }
-  }
-
-  async function disconnectYouTube() {
-    youtubeAuthBusy = true;
-    youtubeAuthMessage = "Removing saved account session…";
-    try {
-      youtubeAuth = await clearYouTubeAuth();
-      youtubeAuthMessage = "YouTube Music account session removed.";
-    } catch (error) {
-      youtubeAuthMessage = error instanceof Error ? error.message : String(error);
-    } finally {
-      youtubeAuthBusy = false;
-    }
-  }
+  let filesystemBackupSupported = $state(false);
+  let backupBusy = $state(false);
+  let backupMessage = $state("");
+  const SHOW_DIAGNOSTICS = false;
 
   async function changeAudioQuality(quality: AudioQuality) {
     try {
@@ -203,6 +180,7 @@
     try {
       await setJellyfinLibraryEnabled(server.id, libraryId, enabled);
       library.version += 1;
+      revisions.libraryChanged();
       jellyfinServerMessages = { ...jellyfinServerMessages, [server.id]: enabled ? "Music library synced and ready to play." : "Music library hidden. Cached metadata remains lightweight." };
     } catch (error) {
       jellyfinServers = jellyfinServers.map((item) => item.id === server.id ? {
@@ -225,6 +203,7 @@
       jellyfinDiagnostics = result.diagnostics;
       upsertJellyfinServer(result.server);
       library.version += 1;
+      revisions.libraryChanged();
       jellyfinServerMessages = { ...jellyfinServerMessages, [server.id]: `Found ${result.server.libraries.length} audio ${result.server.libraries.length === 1 ? "library" : "libraries"}; enabled libraries were synchronized.` };
     } catch (error) {
       await refreshJellyfinServers();
@@ -237,11 +216,20 @@
   }
 
   async function disconnectJellyfin(server: JellyfinServer) {
-    if (!confirm(`Disconnect ${server.name}? This only removes its sources from SunnySong and never deletes anything from Jellyfin.`)) return;
-    await removeJellyfinServer(server.id);
-    jellyfinServers = jellyfinServers.filter((item) => item.id !== server.id);
-    library.version += 1;
-    message = "Jellyfin server disconnected. No server files were changed.";
+    if (jellyfinBusy || !confirm(`Disconnect ${server.name}? This only removes its sources from SunnySong and never deletes anything from Jellyfin.`)) return;
+    jellyfinBusy = true;
+    message = "";
+    try {
+      await removeJellyfinServer(server.id);
+      jellyfinServers = jellyfinServers.filter((item) => item.id !== server.id);
+      library.version += 1;
+      revisions.libraryChanged();
+      message = "Jellyfin server disconnected. No server files were changed.";
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    } finally {
+      jellyfinBusy = false;
+    }
   }
 
   async function loadArtists(reset = false) {
@@ -281,6 +269,8 @@
     try {
       for (const path of paths) await addMusicDirectory(path);
       await Promise.all([refreshDirectories(), loadArtists(true)]);
+      library.version += 1;
+      revisions.libraryChanged();
       message = "Music folders added and scanned.";
     } catch (error) {
       message = error instanceof Error ? error.message : String(error);
@@ -291,10 +281,20 @@
   }
 
   async function removeFolder(directory: MusicDirectory) {
-    if (!confirm(`Remove ${directory.path} from the library? Files on disk will not be deleted.`)) return;
-    await removeMusicDirectory(directory.id);
-    await Promise.all([refreshDirectories(), loadArtists(true)]);
-    message = "Folder removed from the active library. Files were not deleted.";
+    if (busy || !confirm(`Remove ${directory.path} from the library? Files on disk will not be deleted.`)) return;
+    busy = true;
+    message = "";
+    try {
+      await removeMusicDirectory(directory.id);
+      await Promise.all([refreshDirectories(), loadArtists(true)]);
+      library.version += 1;
+      revisions.libraryChanged();
+      message = "Folder removed from the active library. Files were not deleted.";
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    } finally {
+      busy = false;
+    }
   }
 
   async function rescan() {
@@ -303,6 +303,8 @@
     try {
       const reports = await rescanMusicLibrary();
       await Promise.all([refreshDirectories(), loadArtists(true)]);
+      library.version += 1;
+      revisions.libraryChanged();
       const indexed = reports.reduce((sum, report) => sum + report.indexedTracks, 0);
       const issues = reports.filter((report) => report.status !== "READY").length;
       message = issues
@@ -315,6 +317,48 @@
     }
   }
 
+  async function exportDataBackup() {
+    if (backupBusy) return;
+    const date = new Date().toISOString().slice(0, 10);
+    const path = await saveDialog({
+      title: "Export SunnySong Backup",
+      defaultPath: `SunnySong-${date}.sqlite3`,
+      filters: [{ name: "SunnySong SQLite backup", extensions: ["sqlite3"] }],
+    });
+    if (!path) return;
+    backupBusy = true;
+    backupMessage = "Creating a consistent database snapshot…";
+    try {
+      const status = await exportBackup(path);
+      backupMessage = status.message;
+    } catch (error) {
+      backupMessage = error instanceof Error ? error.message : String(error);
+    } finally {
+      backupBusy = false;
+    }
+  }
+
+  async function restoreDataBackup() {
+    if (backupBusy) return;
+    const selected = await openDialog({
+      title: "Restore SunnySong Backup",
+      multiple: false,
+      filters: [{ name: "SunnySong SQLite backup", extensions: ["sqlite3"] }],
+    });
+    const path = Array.isArray(selected) ? selected[0] : selected;
+    if (!path || !confirm("Validate and stage this backup? It will replace local library data, playlists, profiles, and history after you restart SunnySong. Credentials and cookies are kept separately.")) return;
+    backupBusy = true;
+    backupMessage = "Validating and staging restore…";
+    try {
+      const status = await stageBackupRestore(path);
+      backupMessage = status.restartRequired ? `${status.message} Restart required.` : status.message;
+    } catch (error) {
+      backupMessage = error instanceof Error ? error.message : String(error);
+    } finally {
+      backupBusy = false;
+    }
+  }
+
   async function toggleArtist(artist: LocalArtist) {
     const previous = artist.enabled;
     artist.enabled = !previous;
@@ -322,6 +366,7 @@
     try {
       await setLocalArtistEnabled(artist.id, artist.enabled);
       library.version += 1;
+      revisions.libraryChanged();
     } catch (error) {
       artist.enabled = previous;
       artists = [...artists];
@@ -330,12 +375,12 @@
   }
 
   onMount(() => {
+    filesystemBackupSupported = !/Android|iPhone|iPad/i.test(navigator.userAgent);
     void library.initialize();
     void Promise.all([
       refreshDirectories(),
       refreshJellyfinServers(),
       loadArtists(true),
-      getYouTubeAuthStatus().then((status) => youtubeAuth = status),
     ]).catch((error) => {
       message = error instanceof Error ? error.message : String(error);
     });
@@ -346,14 +391,14 @@
 <header class="simple-page-header"><a class="icon-button" href="#/" aria-label="Back to Home">←</a><h1>Settings</h1></header>
 <div class="settings-stack">
   <section class="settings-group library-settings" aria-labelledby="local-library-title">
-    <div class="settings-copy"><h2 id="local-library-title">Local Library</h2><p>Configured folders are always scanned. Artist visibility controls what participates in browsing and recommendations.</p></div>
+    <div class="settings-copy"><h2 id="local-library-title">Local Library</h2></div>
     <div class="library-settings-content">
       <div class="settings-subsection">
         <div class="settings-subheading"><h3>Music Folders</h3><button class="text-button" type="button" onclick={addFolders} disabled={busy}>+ Add Folder</button></div>
         {#if directories.length}
           <ul class="directory-list">
             {#each directories as directory (directory.id)}
-              <li><span><strong>{directory.path}</strong><small>{directory.status === "READY" ? `Ready — ${directory.trackCount.toLocaleString()} tracks` : directory.status === "SCANNING" ? "Scanning…" : directory.status === "UNAVAILABLE" ? "Unavailable — indexed tracks preserved" : `Scan error — ${directory.lastError ?? "some files could not be read"}`}</small>{#if directory.lastScannedAtMs}<small>Last successful scan {new Date(directory.lastScannedAtMs).toLocaleString()}</small>{/if}</span><button class="text-button danger" type="button" onclick={() => removeFolder(directory)}>Remove</button></li>
+              <li><span><strong>{directory.path}</strong><small>{directory.status === "READY" ? `Ready — ${directory.trackCount.toLocaleString()} tracks` : directory.status === "SCANNING" ? "Scanning…" : directory.status === "UNAVAILABLE" ? "Unavailable — indexed tracks preserved" : `Scan error — ${directory.lastError ?? "some files could not be read"}`}</small>{#if directory.lastScannedAtMs}<small>Last successful scan {new Date(directory.lastScannedAtMs).toLocaleString()}</small>{/if}</span><button class="text-button danger" type="button" disabled={busy} onclick={() => removeFolder(directory)}>Remove</button></li>
             {/each}
           </ul>
         {:else}<p class="inline-message">Add a folder to build your local library.</p>{/if}
@@ -425,17 +470,10 @@
     <label class="toggle-setting"><span>{library.discoveryEnabled ? "On" : "Off"}</span><input type="checkbox" checked={library.discoveryEnabled} disabled={library.changingDiscovery} onchange={(event) => library.setDiscovery(event.currentTarget.checked)} /></label>
   </section>
 
-  <section class="settings-group youtube-auth-settings" aria-labelledby="youtube-account-title">
-    <div><h2 id="youtube-account-title">YouTube Music Account</h2><p>{youtubeAuth.configured ? "Session saved. Used by authenticated playback when YouTube blocks anonymous requests." : "Optional. Import a youtube.com Netscape cookies.txt export to retry verification-blocked songs."}</p><p>Use a secondary account if possible: YouTube may restrict accounts used by third-party clients. SunnySong stores the cookies only in your operating system credential store and never asks for your Google password.</p></div>
-    <div class="youtube-auth-controls">
-      {#if youtubeAuth.configured}
-        <button class="text-button danger" type="button" disabled={youtubeAuthBusy} onclick={disconnectYouTube}>{youtubeAuthBusy ? "Removing…" : "Clear account"}</button>
-      {:else}
-        <label><span class="sr-only">YouTube cookies.txt contents</span><textarea autocomplete="off" spellcheck="false" placeholder="# Netscape HTTP Cookie File…" bind:value={youtubeCookies} disabled={youtubeAuthBusy}></textarea></label>
-        <button class="secondary-action" type="button" disabled={youtubeAuthBusy || !youtubeCookies.trim()} onclick={saveYouTubeCookies}>{youtubeAuthBusy ? "Connecting…" : "Import cookies"}</button>
-      {/if}
-      {#if youtubeAuthMessage}<p class="inline-message" role="status">{youtubeAuthMessage}</p>{/if}
-    </div>
+
+  <section class="settings-group data-backup-settings" aria-labelledby="data-backup-title">
+    <div><h2 id="data-backup-title">Backup & Restore</h2><p>Exports a consistent local database snapshot containing library indexes, playlists, profiles, and history. Operating-system credentials and YouTube cookies are never included.</p>{#if !filesystemBackupSupported}<p>Filesystem backup and restore are currently available in the desktop app only; Android content URIs are not yet supported for this feature.</p>{/if}</div>
+    {#if filesystemBackupSupported}<div class="backup-controls"><div class="inline-actions"><button class="secondary-action" type="button" disabled={backupBusy} onclick={exportDataBackup}>{backupBusy ? "Working…" : "Export backup"}</button><button class="secondary-action" type="button" disabled={backupBusy} onclick={restoreDataBackup}>Restore backup…</button></div>{#if backupMessage}<p class="inline-message" role="status">{backupMessage}</p>{/if}</div>{/if}
   </section>
 
   <section class="settings-group" aria-labelledby="data-saver-title">
@@ -452,6 +490,25 @@
     </div>
   </section>
 
+  <section class="settings-group" aria-labelledby="crossfade-title">
+    <div><h2 id="crossfade-title">Crossfade</h2><p>Overlap the end of one song with the start of the next.</p></div>
+    <div class="segmented-control playback-settings-control" aria-label="Crossfade duration">
+      {#each [[0, "Off"], [2, "2 sec"], [5, "5 sec"], [10, "10 sec"]] as option}
+        <button type="button" class:active={player.crossfadeDuration === option[0]} aria-pressed={player.crossfadeDuration === option[0]} onclick={() => player.setCrossfadeDuration(option[0] as 0 | 2 | 5 | 10)}>{option[1]}</button>
+      {/each}
+    </div>
+  </section>
+
+  <section class="settings-group" aria-labelledby="normalization-title">
+    <div><h2 id="normalization-title">Volume normalization</h2><p>Reduce loudness differences between songs or albums. Normalization activates only where gain metadata exists; it never boosts volume.</p></div>
+    <div class="segmented-control playback-settings-control normalization-control" aria-label="Volume normalization mode">
+      {#each [["off", "Off"], ["track", "Track"], ["album", "Album"]] as option}
+        <button type="button" class:active={player.normalizationMode === option[0]} aria-pressed={player.normalizationMode === option[0]} onclick={() => player.setNormalizationMode(option[0] as "off" | "track" | "album")}>{option[1]}</button>
+      {/each}
+    </div>
+  </section>
+
+
   <section class="settings-group" aria-labelledby="motion-title">
     <div><h2 id="motion-title">Interface animations</h2><p>Use subtle movement when opening panels and changing views. Turn this off for an instant, simpler interface.</p></div>
     <label class="toggle-setting"><span>{motion.enabled ? "On" : "Off"}</span><input type="checkbox" checked={motion.enabled} onchange={(event) => motion.set(event.currentTarget.checked)} /></label>
@@ -463,6 +520,6 @@
       {#each options as option}<button type="button" class:active={theme.preference === option.value} aria-pressed={theme.preference === option.value} onclick={() => theme.set(option.value)}>{option.label}</button>{/each}
     </div>
   </section>
-  <section class="settings-group"><div><h2>Diagnostics</h2><p>Inspect database health, player state, timings, and recommendation scoring.</p></div><a class="primary-action" href="#/diagnostics">Open</a></section>
+  {#if SHOW_DIAGNOSTICS}<section class="settings-group"><div><h2>Diagnostics</h2><p>Inspect database health, player state, timings, and recommendation scoring.</p></div><a class="primary-action" href="#/diagnostics">Open</a></section>{/if}
   <section class="settings-group"><div><h2>About</h2><p>Version and release history.</p></div><a class="primary-action" href="#/about">View changelog</a></section>
 </div>

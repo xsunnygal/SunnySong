@@ -20,7 +20,7 @@ use solmusic_application::{
     domain::{ArtistRef, Song, SongId},
     ArtistPage, AudioQuality, CatalogArtist, CatalogCollection, CatalogFilter,
     CatalogSearchResults, Lyrics, MusicProvider, PlaybackRequestProfile, PlaybackSource,
-    ProviderError,
+    ProviderError, TimedLyricsLine,
 };
 use uuid::Uuid;
 
@@ -28,6 +28,9 @@ const MUSIC_API_BASE: &str = "https://music.youtube.com/youtubei/v1";
 const PLAYER_API_BASE: &str = "https://www.youtube.com/youtubei/v1";
 const MOBILE_PLAYER_API_BASE: &str = "https://youtubei.googleapis.com/youtubei/v1";
 const WEB_CLIENT_VERSION: &str = "1.20240819.01.00";
+const ANDROID_MUSIC_CLIENT_VERSION: &str = "7.27.52";
+const ANDROID_MUSIC_USER_AGENT: &str =
+    "com.google.android.apps.youtube.music/7.27.52 (Linux; U; Android 14; en_US)";
 const VISIONOS_CLIENT_VERSION: &str = "1.04";
 const ANDROID_VR_CLIENT_VERSION: &str = "1.43.32";
 const WEB_USER_AGENT: &str =
@@ -590,6 +593,24 @@ impl MusicProvider for YouTubeMusicProvider {
         parse_related(&response, limit)
     }
 
+    async fn search_suggestions(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, ProviderError> {
+        if query.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let response = self
+            .post(
+                "music/get_search_suggestions",
+                json!({ "context": web_context(), "input": query }),
+                InnertubeClient::WebRemix,
+            )
+            .await?;
+        Ok(parse_search_suggestions(&response, limit))
+    }
+
     async fn lyrics(&self, song_id: &SongId) -> Result<Option<Lyrics>, ProviderError> {
         let next = self
             .post(
@@ -604,6 +625,21 @@ impl MusicProvider for YouTubeMusicProvider {
         let Some(browse_id) = parse_lyrics_browse_id(&next) else {
             return Ok(None);
         };
+        let timed = self
+            .post(
+                "browse",
+                json!({
+                    "context": android_music_context(),
+                    "browseId": browse_id,
+                }),
+                InnertubeClient::AndroidMusic,
+            )
+            .await;
+        if let Ok(timed) = timed {
+            if let Some(lyrics) = parse_timed_lyrics(&timed) {
+                return Ok(Some(lyrics));
+            }
+        }
         let browse = self
             .post(
                 "browse",
@@ -722,30 +758,34 @@ where
 #[derive(Clone, Copy)]
 enum InnertubeClient {
     WebRemix,
+    AndroidMusic,
 }
 
 impl InnertubeClient {
     fn api_base(self) -> &'static str {
         match self {
-            Self::WebRemix => MUSIC_API_BASE,
+            Self::WebRemix | Self::AndroidMusic => MUSIC_API_BASE,
         }
     }
 
     fn version(self) -> &'static str {
         match self {
             Self::WebRemix => WEB_CLIENT_VERSION,
+            Self::AndroidMusic => ANDROID_MUSIC_CLIENT_VERSION,
         }
     }
 
     fn numeric_name(self) -> &'static str {
         match self {
             Self::WebRemix => "67",
+            Self::AndroidMusic => "21",
         }
     }
 
     fn user_agent(self) -> &'static str {
         match self {
             Self::WebRemix => WEB_USER_AGENT,
+            Self::AndroidMusic => ANDROID_MUSIC_USER_AGENT,
         }
     }
 }
@@ -876,6 +916,20 @@ fn random_playback_token(length: usize) -> String {
         .collect()
 }
 
+fn android_music_context() -> Value {
+    json!({
+        "client": {
+            "clientName": "ANDROID_MUSIC",
+            "clientVersion": ANDROID_MUSIC_CLIENT_VERSION,
+            "androidSdkVersion": 34,
+            "osName": "Android",
+            "osVersion": "14",
+            "hl": "en",
+            "gl": "US"
+        }
+    })
+}
+
 fn web_context() -> Value {
     json!({
         "client": {
@@ -962,8 +1016,111 @@ fn parse_lyrics(root: &Value) -> Option<Lyrics> {
         .filter(|value| !value.is_empty());
     Some(Lyrics {
         text: text.to_owned(),
+        lines: Vec::new(),
+        synchronized: false,
         attribution,
     })
+}
+
+fn parse_timed_lyrics(root: &Value) -> Option<Lyrics> {
+    let model = find_renderers(root, "timedLyricsModel")
+        .into_iter()
+        .next()?;
+    let attribution = model
+        .get("attribution")
+        .and_then(text_object)
+        .or_else(|| model.get("footer").and_then(text_object))
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let mut lines = Vec::new();
+    collect_timed_lines(model, &mut lines);
+    lines.sort_by_key(|line| line.start_ms);
+    lines.dedup_by(|left, right| left.start_ms == right.start_ms && left.text == right.text);
+    if lines.is_empty() {
+        return None;
+    }
+    for index in 0..lines.len().saturating_sub(1) {
+        if lines[index].end_ms.is_none() {
+            lines[index].end_ms = Some(lines[index + 1].start_ms);
+        }
+    }
+    let text = lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(Lyrics {
+        text,
+        lines,
+        synchronized: true,
+        attribution,
+    })
+}
+
+fn collect_timed_lines(value: &Value, target: &mut Vec<TimedLyricsLine>) {
+    match value {
+        Value::Object(object) => {
+            let start = object
+                .get("startTimeMilliseconds")
+                .or_else(|| {
+                    object
+                        .get("cueRange")
+                        .and_then(|range| range.get("startTimeMilliseconds"))
+                })
+                .and_then(json_u64);
+            let text = object
+                .get("lyricLine")
+                .and_then(Value::as_str)
+                .or_else(|| object.get("text").and_then(Value::as_str));
+            if let (Some(start_ms), Some(text)) =
+                (start, text.map(str::trim).filter(|text| !text.is_empty()))
+            {
+                let end_ms = object
+                    .get("endTimeMilliseconds")
+                    .or_else(|| {
+                        object
+                            .get("cueRange")
+                            .and_then(|range| range.get("endTimeMilliseconds"))
+                    })
+                    .and_then(json_u64)
+                    .or_else(|| {
+                        object
+                            .get("durationMilliseconds")
+                            .and_then(json_u64)
+                            .map(|duration| start_ms.saturating_add(duration))
+                    });
+                target.push(TimedLyricsLine {
+                    start_ms,
+                    end_ms,
+                    text: text.to_owned(),
+                });
+            }
+            for child in object.values() {
+                collect_timed_lines(child, target);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_timed_lines(child, target);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn json_u64(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| value.as_str()?.parse().ok())
+}
+
+fn parse_search_suggestions(root: &Value, limit: usize) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    find_renderers(root, "searchSuggestionRenderer")
+        .into_iter()
+        .filter_map(|renderer| renderer.get("suggestion").and_then(text_object))
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty() && seen.insert(value.to_lowercase()))
+        .take(limit)
+        .collect()
 }
 
 fn parse_search(root: &Value, limit: usize) -> Result<Vec<Song>, ProviderError> {
@@ -1471,6 +1628,7 @@ fn parse_playback(
         mime_type,
         local_path: None,
         request_profile,
+        normalization_gain_metadata: None,
     })
 }
 
@@ -1648,6 +1806,38 @@ mod tests {
         assert_eq!(
             lyrics.attribution.as_deref(),
             Some("Provided by Musixmatch")
+        );
+    }
+
+    #[test]
+    fn parses_timed_lyrics_model_and_search_suggestions() {
+        let timed = json!({ "contents": { "timedLyricsModel": {
+            "lyricsData": { "timedLyricsData": [
+                { "cueRange": { "startTimeMilliseconds": "1000", "endTimeMilliseconds": "2500" }, "lyricLine": "First" },
+                { "cueRange": { "startTimeMilliseconds": "2500" }, "lyricLine": "Second" }
+            ]},
+            "attribution": { "runs": [{ "text": "Provided by Example" }] }
+        }}});
+        let lyrics = parse_timed_lyrics(&timed).unwrap();
+        assert!(lyrics.synchronized);
+        assert_eq!(lyrics.lines.len(), 2);
+        assert_eq!(lyrics.lines[0].end_ms, Some(2_500));
+        assert_eq!(lyrics.attribution.as_deref(), Some("Provided by Example"));
+
+        let suggestions = json!({ "contents": [
+            { "searchSuggestionRenderer": { "suggestion": { "runs": [{ "text": "sunny song" }] } } },
+            { "searchSuggestionRenderer": { "suggestion": { "runs": [{ "text": "Sunny Song" }] } } },
+            { "searchSuggestionRenderer": { "suggestion": { "simpleText": "sunny artist" } } }
+        ]});
+        assert_eq!(
+            parse_search_suggestions(&suggestions, 10),
+            vec!["sunny song", "sunny artist"]
+        );
+        assert_eq!(
+            android_music_context()
+                .pointer("/client/clientName")
+                .and_then(Value::as_str),
+            Some("ANDROID_MUSIC")
         );
     }
 

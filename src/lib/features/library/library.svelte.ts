@@ -1,4 +1,3 @@
-import { convertFileSrc } from "@tauri-apps/api/core";
 import {
 	getDiscoveryEnabled,
 	setAudioQuality as setBackendAudioQuality,
@@ -6,6 +5,7 @@ import {
 	type AudioQuality,
 	type Song,
 } from "$lib/api/backend";
+import { revisions } from "$lib/features/revisions.svelte";
 
 const DATA_SAVER_KEY = "solmusic-data-saver";
 const AUDIO_QUALITY_KEY = "solmusic-audio-quality";
@@ -68,6 +68,7 @@ class LibraryController {
 		try {
 			await setDiscoveryEnabled(enabled);
 			this.version += 1;
+			revisions.libraryChanged();
 		} catch (error) {
 			this.discoveryEnabled = previous;
 			throw error;
@@ -78,9 +79,7 @@ class LibraryController {
 
 	image(url: string | null) {
 		if (!url) return null;
-		if (url.startsWith("local-artwork:")) {
-			return convertFileSrc(url.slice("local-artwork:".length));
-		}
+
 		if (!this.dataSaverEnabled || !url.startsWith("http")) return url;
 		if (/googleusercontent\.com|ggpht\.com/.test(url)) {
 			return /=w\d+-h\d+[^?#]*/.test(url)

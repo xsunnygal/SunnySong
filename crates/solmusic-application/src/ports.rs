@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use async_trait::async_trait;
-use solmusic_domain::{ListeningSummary, Song, SongId, TrackProfile};
+use solmusic_domain::{ListeningSummary, NormalizationGainMetadata, Song, SongId, TrackProfile};
 
 use crate::{ProviderError, StorageError};
 
@@ -21,13 +21,14 @@ pub enum PlaybackRequestProfile {
     AndroidVr,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlaybackSource {
     pub url: String,
     pub mime_type: String,
     pub expires_at_ms: Option<i64>,
     pub local_path: Option<PathBuf>,
     pub request_profile: PlaybackRequestProfile,
+    pub normalization_gain_metadata: Option<NormalizationGainMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +120,20 @@ pub struct PlaylistTrack {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaylistItemSource {
+    Local { path: PathBuf, available: bool },
+    YouTube,
+    Jellyfin,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistExportTrack {
+    pub song: Song,
+    pub source: PlaylistItemSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MusicDirectory {
     pub id: i64,
     pub path: String,
@@ -138,29 +153,111 @@ pub struct LocalArtist {
     pub track_count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScannedLocalTrack {
+    pub local_file_id: Option<i64>,
     pub song: Song,
     pub canonical_path: String,
     pub relative_path: String,
     pub mime_type: String,
     pub file_size_bytes: u64,
     pub modified_at_ms: i64,
+    pub modified_at_ns: Option<i64>,
     pub source_identity: Option<String>,
+    pub sidecar_artwork_path: Option<String>,
+    pub sidecar_artwork_size_bytes: Option<u64>,
+    pub sidecar_artwork_modified_at_ns: Option<i64>,
+    pub normalization_gain_metadata: Option<NormalizationGainMetadata>,
     pub artist_names: Vec<String>,
     pub first_seen_at_ms: i64,
+    pub metadata_changed: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LocalPlaybackFile {
     pub path: PathBuf,
     pub mime_type: String,
+    pub normalization_gain_metadata: Option<NormalizationGainMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimedLyricsLine {
+    pub start_ms: u64,
+    pub end_ms: Option<u64>,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lyrics {
     pub text: String,
+    pub lines: Vec<TimedLyricsLine>,
+    pub synchronized: bool,
     pub attribution: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEvent {
+    pub sequence_id: i64,
+    pub event_id: String,
+    pub song: Song,
+    pub started_at_ms: i64,
+    pub listened_ms: u64,
+    pub duration_ms: Option<u64>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecapSong {
+    pub song: Song,
+    pub listened_ms: u64,
+    pub plays: u64,
+    pub completions: u64,
+    pub skips: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecapArtist {
+    pub artist_id: Option<String>,
+    pub artist_name: String,
+    pub listened_ms: u64,
+    pub plays: u64,
+    pub completions: u64,
+    pub skips: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecapCoverage {
+    pub requested_from_ms: Option<i64>,
+    pub requested_to_ms: Option<i64>,
+    pub available_from_ms: Option<i64>,
+    pub complete_from_ms: i64,
+    pub complete: bool,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListeningRecap {
+    pub total_listened_ms: u64,
+    pub plays: u64,
+    pub completions: u64,
+    pub skips: u64,
+    pub unique_songs: u64,
+    pub unique_artists: u64,
+    pub top_songs: Vec<RecapSong>,
+    pub top_artists: Vec<RecapArtist>,
+    pub coverage: RecapCoverage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadRecord {
+    pub id: String,
+    pub song: Song,
+    pub status: String,
+    pub location: Option<String>,
+    pub file_name: Option<String>,
+    pub error: Option<String>,
+    pub created_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +298,7 @@ pub struct LibraryScanResult {
     pub directory_id: i64,
     pub status: String,
     pub indexed_tracks: usize,
+    pub unchanged_tracks: usize,
     pub unavailable_tracks: usize,
     pub skipped_files: usize,
     pub duration_ms: u64,
@@ -239,6 +337,13 @@ pub trait MusicProvider: Send + Sync {
         ))
     }
     async fn related(&self, song_id: &SongId, limit: usize) -> Result<Vec<Song>, ProviderError>;
+    async fn search_suggestions(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> Result<Vec<String>, ProviderError> {
+        Ok(Vec::new())
+    }
     async fn lyrics(&self, _song_id: &SongId) -> Result<Option<Lyrics>, ProviderError> {
         Ok(None)
     }
@@ -312,8 +417,120 @@ pub trait MusicRepository: Send + Sync {
     ) -> Result<PlaylistTrack, StorageError> {
         Err(StorageError("playlists are unavailable".into()))
     }
+    fn rename_playlist(
+        &self,
+        _playlist_id: &str,
+        _name: &str,
+        _now_ms: i64,
+    ) -> Result<Playlist, StorageError> {
+        Err(StorageError("playlists are unavailable".into()))
+    }
+    fn delete_playlist(&self, _playlist_id: &str) -> Result<(), StorageError> {
+        Err(StorageError("playlists are unavailable".into()))
+    }
+    fn remove_song_from_playlist(
+        &self,
+        _playlist_id: &str,
+        _song_id: &SongId,
+        _now_ms: i64,
+    ) -> Result<(), StorageError> {
+        Err(StorageError("playlists are unavailable".into()))
+    }
+    fn reorder_playlist_tracks(
+        &self,
+        _playlist_id: &str,
+        _song_ids: &[String],
+        _now_ms: i64,
+    ) -> Result<Vec<PlaylistTrack>, StorageError> {
+        Err(StorageError("playlists are unavailable".into()))
+    }
+    fn playlist_export_tracks(
+        &self,
+        _playlist_id: &str,
+    ) -> Result<Vec<PlaylistExportTrack>, StorageError> {
+        Err(StorageError("playlist export is unavailable".into()))
+    }
+    fn song_by_id(&self, _song_id: &SongId) -> Result<Option<Song>, StorageError> {
+        Ok(None)
+    }
+    fn song_by_local_path(&self, _path: &PathBuf) -> Result<Option<Song>, StorageError> {
+        Ok(None)
+    }
+    fn create_playlist_from_songs(
+        &self,
+        _name: &str,
+        _song_ids: &[SongId],
+        _now_ms: i64,
+    ) -> Result<Playlist, StorageError> {
+        Err(StorageError("playlist import is unavailable".into()))
+    }
+    fn create_backup(&self, _destination: &PathBuf) -> Result<(), StorageError> {
+        Err(StorageError("database backup is unavailable".into()))
+    }
     fn liked_song_ids(&self) -> Result<Vec<String>, StorageError> {
         Ok(Vec::new())
+    }
+    fn liked_songs(&self, _limit: usize, _offset: usize) -> Result<Vec<Song>, StorageError> {
+        Ok(Vec::new())
+    }
+    fn history_events(
+        &self,
+        _limit: usize,
+        _before: Option<i64>,
+    ) -> Result<Vec<HistoryEvent>, StorageError> {
+        Ok(Vec::new())
+    }
+    fn delete_history_event(&self, _event_id: &str) -> Result<(), StorageError> {
+        Err(StorageError("history editing is unavailable".into()))
+    }
+    fn delete_song_history(&self, _song_id: &SongId) -> Result<u64, StorageError> {
+        Err(StorageError("history editing is unavailable".into()))
+    }
+    fn clear_history(&self) -> Result<u64, StorageError> {
+        Err(StorageError("history editing is unavailable".into()))
+    }
+    fn listening_recap(
+        &self,
+        _from_ms: Option<i64>,
+        _to_ms: Option<i64>,
+        _limit: usize,
+    ) -> Result<ListeningRecap, StorageError> {
+        Err(StorageError("listening recap is unavailable".into()))
+    }
+    fn local_text_suggestions(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        Ok(Vec::new())
+    }
+    fn create_download_attempt(
+        &self,
+        _song: &Song,
+        _created_at_ms: i64,
+    ) -> Result<DownloadRecord, StorageError> {
+        Err(StorageError("download registry is unavailable".into()))
+    }
+    fn finish_download_attempt(
+        &self,
+        _download_id: &str,
+        _status: &str,
+        _location: Option<&str>,
+        _file_name: Option<&str>,
+        _error: Option<&str>,
+        _completed_at_ms: i64,
+    ) -> Result<(), StorageError> {
+        Err(StorageError("download registry is unavailable".into()))
+    }
+    fn downloads(
+        &self,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<DownloadRecord>, StorageError> {
+        Ok(Vec::new())
+    }
+    fn remove_download(&self, _download_id: &str) -> Result<(), StorageError> {
+        Err(StorageError("download registry is unavailable".into()))
     }
     fn artist_affinities(&self) -> Result<HashMap<String, f64>, StorageError> {
         Ok(HashMap::new())
@@ -338,6 +555,12 @@ pub trait MusicRepository: Send + Sync {
     fn remove_music_directory(&self, _directory_id: i64) -> Result<(), StorageError> {
         Err(StorageError("local library is unavailable".into()))
     }
+    fn local_scan_state(&self, _directory_id: i64) -> Result<Vec<ScannedLocalTrack>, StorageError> {
+        Ok(Vec::new())
+    }
+    fn referenced_local_artwork(&self) -> Result<Vec<String>, StorageError> {
+        Ok(Vec::new())
+    }
     fn replace_directory_scan(
         &self,
         _directory_id: i64,
@@ -355,6 +578,13 @@ pub trait MusicRepository: Send + Sync {
         _status: &str,
         _error: Option<&str>,
         _attempted_at_ms: i64,
+    ) -> Result<(), StorageError> {
+        Err(StorageError("local library is unavailable".into()))
+    }
+    fn mark_local_file_missing(
+        &self,
+        _canonical_path: &str,
+        _missing_since_ms: i64,
     ) -> Result<(), StorageError> {
         Err(StorageError("local library is unavailable".into()))
     }

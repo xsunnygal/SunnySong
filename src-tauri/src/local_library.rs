@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -9,12 +9,12 @@ use std::{
 use lofty::{
     file::{AudioFile, TaggedFileExt},
     probe::Probe,
-    tag::{Accessor, ItemKey},
+    tag::{Accessor, ItemKey, Tag},
 };
 use sha2::{Digest, Sha256};
 use solmusic_application::{
     domain::{ArtistRef, Song, SongId},
-    MusicDirectory, ScannedLocalTrack,
+    Lyrics, MusicDirectory, NormalizationGainMetadata, ScannedLocalTrack, TimedLyricsLine,
 };
 use tracing::{debug, warn};
 use walkdir::WalkDir;
@@ -24,6 +24,26 @@ pub struct ScanBatch {
     pub skipped_files: usize,
     pub complete: bool,
     pub duration_ms: u64,
+}
+
+struct FileObservation {
+    canonical: PathBuf,
+    canonical_path: String,
+    relative_path: String,
+    mime_type: &'static str,
+    file_size_bytes: u64,
+    modified_at_ms: i64,
+    modified_at_ns: Option<i64>,
+    source_identity: Option<String>,
+    sidecar_artwork: Option<SidecarArtwork>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SidecarArtwork {
+    path: PathBuf,
+    canonical_path: String,
+    file_size_bytes: u64,
+    modified_at_ns: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -47,11 +67,39 @@ impl LocalArtworkStore {
         }
         Some(format!("local-artwork:{}", path.to_string_lossy()))
     }
+
+    pub fn prune(&self, referenced: &[String]) -> Result<usize, String> {
+        let referenced = referenced
+            .iter()
+            .filter_map(|marker| marker.strip_prefix("local-artwork:"))
+            .map(PathBuf::from)
+            .collect::<HashSet<_>>();
+        let mut removed = 0;
+        for entry in std::fs::read_dir(&self.root)
+            .map_err(|error| format!("could not inspect local artwork cache: {error}"))?
+        {
+            let entry =
+                entry.map_err(|error| format!("could not inspect cached artwork: {error}"))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("could not inspect cached artwork type: {error}"))?;
+            let path = entry.path();
+            if !file_type.is_file() || !is_managed_artwork_file(&path) || referenced.contains(&path)
+            {
+                continue;
+            }
+            std::fs::remove_file(&path)
+                .map_err(|error| format!("could not remove stale cached artwork: {error}"))?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
 }
 
 pub fn scan_directory(
     directory: &MusicDirectory,
     artwork: &LocalArtworkStore,
+    previous: &[ScannedLocalTrack],
 ) -> Result<ScanBatch, String> {
     let started = Instant::now();
     tracing::info!(category = "SCANNER", event = "directory_scan_started", directory_id = directory.id, path = %directory.path);
@@ -65,9 +113,27 @@ pub fn scan_directory(
         ));
     }
 
+    let by_path = previous
+        .iter()
+        .enumerate()
+        .map(|(index, track)| (track.canonical_path.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut identity_counts = HashMap::new();
+    let mut by_identity = HashMap::new();
+    for (index, track) in previous.iter().enumerate() {
+        if let Some(identity) = track.source_identity.as_deref() {
+            *identity_counts.entry(identity).or_insert(0_usize) += 1;
+            by_identity.insert(identity, index);
+        }
+    }
+
     let first_seen_at_ms = current_time_ms();
     let mut tracks = Vec::new();
+    let mut indexed_tracks: usize = 0;
+    let mut unchanged_tracks: usize = 0;
     let mut skipped_files = 0;
+    let mut reused_local_files = HashSet::new();
+    let mut sidecar_artwork_by_directory = HashMap::new();
     for entry in WalkDir::new(&root).follow_links(false).into_iter() {
         let entry = match entry {
             Ok(entry) => entry,
@@ -83,9 +149,65 @@ pub fn scan_directory(
         let Some(mime_type) = supported_mime_type(entry.path()) else {
             continue;
         };
-        match scan_track(&root, entry.path(), mime_type, first_seen_at_ms, artwork) {
-            Ok(track) => tracks.push(track),
+        let sidecar_artwork = entry.path().parent().and_then(|parent| {
+            sidecar_artwork_by_directory
+                .entry(parent.to_path_buf())
+                .or_insert_with(|| folder_artwork_candidate(entry.path()))
+                .clone()
+        });
+        let observation = match observe_file(&root, entry.path(), mime_type, sidecar_artwork) {
+            Ok(observation) => observation,
             Err(error) => {
+                skipped_files += 1;
+                warn!(category = "LOCAL_LIBRARY", event = "track_scan_failed", path = %entry.path().display(), reason = %error);
+                continue;
+            }
+        };
+        let previous_track = by_path
+            .get(observation.canonical_path.as_str())
+            .copied()
+            .or_else(|| {
+                let identity = observation.source_identity.as_deref()?;
+                (identity_counts.get(identity) == Some(&1))
+                    .then(|| by_identity[identity])
+                    .filter(|index| !Path::new(&previous[*index].canonical_path).is_file())
+            })
+            .and_then(|index| {
+                let track = &previous[index];
+                let available = track
+                    .local_file_id
+                    .is_none_or(|local_file_id| !reused_local_files.contains(&local_file_id));
+                available.then_some(track)
+            });
+
+        let result = if previous_track.is_some_and(|track| is_unchanged(track, &observation)) {
+            let mut track = previous_track
+                .expect("unchanged files have previous scan state")
+                .clone();
+            track.canonical_path = observation.canonical_path;
+            track.relative_path = observation.relative_path;
+            track.mime_type = observation.mime_type.into();
+            track.file_size_bytes = observation.file_size_bytes;
+            track.modified_at_ms = observation.modified_at_ms;
+            track.modified_at_ns = observation.modified_at_ns;
+            track.source_identity = observation.source_identity;
+            apply_sidecar_state(&mut track, observation.sidecar_artwork.as_ref());
+            track.metadata_changed = false;
+            unchanged_tracks += 1;
+            Ok(track)
+        } else {
+            indexed_tracks += 1;
+            scan_track(observation, previous_track, first_seen_at_ms, artwork)
+        };
+        match result {
+            Ok(track) => {
+                if let Some(local_file_id) = track.local_file_id {
+                    reused_local_files.insert(local_file_id);
+                }
+                tracks.push(track);
+            }
+            Err(error) => {
+                indexed_tracks = indexed_tracks.saturating_sub(1);
                 skipped_files += 1;
                 warn!(category = "LOCAL_LIBRARY", event = "track_scan_failed", path = %entry.path().display(), reason = %error);
             }
@@ -101,7 +223,8 @@ pub fn scan_directory(
             "directory_scan_partial"
         },
         directory_id = directory.id,
-        indexed_tracks = tracks.len(),
+        indexed_tracks,
+        unchanged_tracks,
         skipped_files,
         duration_ms
     );
@@ -113,7 +236,15 @@ pub fn scan_directory(
     })
 }
 
-pub fn read_embedded_lyrics(path: &Path) -> Result<Option<String>, String> {
+pub fn read_embedded_lyrics(path: &Path) -> Result<Option<Lyrics>, String> {
+    let sidecar = path.with_extension("lrc");
+    if sidecar.is_file() {
+        if let Ok(text) = std::fs::read_to_string(&sidecar) {
+            if let Some(lyrics) = parse_lyrics_text(&text) {
+                return Ok(Some(lyrics));
+            }
+        }
+    }
     let tagged = Probe::open(path)
         .and_then(|probe| probe.read())
         .map_err(|error| format!("could not read audio metadata: {error}"))?;
@@ -126,22 +257,78 @@ pub fn read_embedded_lyrics(path: &Path) -> Result<Option<String>, String> {
                 .iter()
                 .find_map(|tag| tag.get_string(&ItemKey::Lyrics))
         });
-    Ok(value.and_then(normalize_lyrics))
+    Ok(value.and_then(parse_lyrics_text))
 }
 
-fn normalize_lyrics(value: &str) -> Option<String> {
+fn parse_lyrics_text(value: &str) -> Option<Lyrics> {
     let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
     let trimmed = normalized.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut offset_ms = 0_i64;
+    let mut lines = Vec::new();
+    for raw_line in trimmed.lines() {
+        if let Some(raw_offset) = raw_line
+            .strip_prefix("[offset:")
+            .and_then(|line| line.strip_suffix(']'))
+        {
+            offset_ms = raw_offset.trim().parse().unwrap_or(0);
+            continue;
+        }
+        let mut remaining = raw_line;
+        let mut timestamps = Vec::new();
+        while let Some(after_open) = remaining.strip_prefix('[') {
+            let Some((stamp, rest)) = after_open.split_once(']') else {
+                break;
+            };
+            let Some(start_ms) = parse_lrc_timestamp(stamp) else {
+                break;
+            };
+            timestamps.push(start_ms.saturating_add_signed(offset_ms));
+            remaining = rest;
+        }
+        let text = remaining.trim();
+        if !text.is_empty() {
+            lines.extend(timestamps.into_iter().map(|start_ms| TimedLyricsLine {
+                start_ms,
+                end_ms: None,
+                text: text.to_owned(),
+            }));
+        }
+    }
+    lines.sort_by_key(|line| line.start_ms);
+    for index in 0..lines.len().saturating_sub(1) {
+        lines[index].end_ms = Some(lines[index + 1].start_ms);
+    }
+    Some(Lyrics {
+        text: trimmed.to_owned(),
+        synchronized: !lines.is_empty(),
+        lines,
+        attribution: None,
+    })
 }
 
-fn scan_track(
+fn parse_lrc_timestamp(value: &str) -> Option<u64> {
+    let (minutes, seconds) = value.split_once(':')?;
+    let minutes = minutes.parse::<u64>().ok()?;
+    let seconds = seconds.parse::<f64>().ok()?;
+    if !(0.0..60.0).contains(&seconds) {
+        return None;
+    }
+    Some(
+        minutes
+            .saturating_mul(60_000)
+            .saturating_add((seconds * 1_000.0).round() as u64),
+    )
+}
+
+fn observe_file(
     root: &Path,
     path: &Path,
     mime_type: &'static str,
-    first_seen_at_ms: i64,
-    artwork: &LocalArtworkStore,
-) -> Result<ScannedLocalTrack, String> {
+    sidecar_artwork: Option<SidecarArtwork>,
+) -> Result<FileObservation, String> {
     let canonical = path
         .canonicalize()
         .map_err(|error| format!("could not canonicalize file: {error}"))?;
@@ -161,70 +348,131 @@ fn scan_track(
     let metadata = canonical
         .metadata()
         .map_err(|error| format!("could not read file metadata: {error}"))?;
-    let file_size_bytes = metadata.len();
-    let source_identity = filesystem_source_identity(&metadata);
-    let modified_at_ms = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map(|value| value.as_millis() as i64)
-        .unwrap_or(0);
-    let song_id = SongId::new(format!(
-        "local:{}",
-        content_identity(&canonical, file_size_bytes)?
-    ))
-    .expect("generated local song ID is nonblank");
+    let modified = metadata.modified().ok();
+    Ok(FileObservation {
+        sidecar_artwork,
+        canonical,
+        canonical_path,
+        relative_path,
+        mime_type,
+        file_size_bytes: metadata.len(),
+        modified_at_ms: modified.and_then(system_time_ms).unwrap_or(0),
+        modified_at_ns: modified.and_then(system_time_ns),
+        source_identity: filesystem_source_identity(&metadata),
+    })
+}
 
-    let tagged = Probe::open(&canonical)
+fn is_unchanged(previous: &ScannedLocalTrack, current: &FileObservation) -> bool {
+    cached_artwork_available(previous.song.thumbnail_url.as_deref())
+        && previous.file_size_bytes == current.file_size_bytes
+        && previous.modified_at_ns.is_some()
+        && previous.modified_at_ns == current.modified_at_ns
+        && previous.sidecar_artwork_path.as_deref()
+            == current
+                .sidecar_artwork
+                .as_ref()
+                .map(|candidate| candidate.canonical_path.as_str())
+        && previous.sidecar_artwork_size_bytes
+            == current
+                .sidecar_artwork
+                .as_ref()
+                .map(|candidate| candidate.file_size_bytes)
+        && previous.sidecar_artwork_modified_at_ns
+            == current
+                .sidecar_artwork
+                .as_ref()
+                .and_then(|candidate| candidate.modified_at_ns)
+}
+
+fn cached_artwork_available(marker: Option<&str>) -> bool {
+    marker
+        .and_then(|value| value.strip_prefix("local-artwork:"))
+        .is_none_or(|path| Path::new(path).is_file())
+}
+
+fn apply_sidecar_state(track: &mut ScannedLocalTrack, sidecar: Option<&SidecarArtwork>) {
+    track.sidecar_artwork_path = sidecar.map(|candidate| candidate.canonical_path.clone());
+    track.sidecar_artwork_size_bytes = sidecar.map(|candidate| candidate.file_size_bytes);
+    track.sidecar_artwork_modified_at_ns = sidecar.and_then(|candidate| candidate.modified_at_ns);
+}
+
+fn scan_track(
+    observation: FileObservation,
+    previous: Option<&ScannedLocalTrack>,
+    first_seen_at_ms: i64,
+    artwork: &LocalArtworkStore,
+) -> Result<ScannedLocalTrack, String> {
+    let song_id = previous.map_or_else(
+        || {
+            SongId::new(format!(
+                "local:{}",
+                content_identity(&observation.canonical, observation.file_size_bytes)?
+            ))
+            .ok_or_else(|| "generated local song ID was blank".to_owned())
+        },
+        |track| Ok(track.song.id.clone()),
+    )?;
+
+    let tagged = Probe::open(&observation.canonical)
         .and_then(|probe| probe.read())
         .map_err(|error| format!("could not read audio metadata: {error}"));
-    let fallback_title = canonical
+    let fallback_title = observation
+        .canonical
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("Unknown Track")
         .to_owned();
 
-    let (title, track_artist, album_artist, album_name, duration_ms, embedded_artwork) =
-        match tagged {
-            Ok(tagged) => {
-                let tag = tagged.primary_tag().or_else(|| tagged.first_tag());
-                let title = tag
-                    .and_then(|tag| tag.title())
-                    .map(|value| value.trim().to_owned())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or(fallback_title);
-                let track_artist = tag
-                    .and_then(|tag| tag.artist())
-                    .map(|value| value.trim().to_owned())
-                    .filter(|value| !value.is_empty());
-                let album_artist = tag
-                    .and_then(|tag| tag.get_string(&ItemKey::AlbumArtist))
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_owned);
-                let album_name = tag
-                    .and_then(|tag| tag.album())
-                    .map(|value| value.trim().to_owned())
-                    .filter(|value| !value.is_empty());
-                let duration = tagged.properties().duration().as_millis();
-                let duration_ms = (duration > 0).then_some(duration.min(u64::MAX as u128) as u64);
-                let embedded_artwork = tag
-                    .and_then(|tag| tag.pictures().first())
-                    .and_then(|picture| artwork.cache(picture.data()));
-                (
-                    title,
-                    track_artist,
-                    album_artist,
-                    album_name,
-                    duration_ms,
-                    embedded_artwork,
-                )
-            }
-            Err(error) => {
-                debug!(category = "LOCAL_LIBRARY", event = "metadata_fallback_used", path = %canonical.display(), reason = %error);
-                (fallback_title, None, None, None, None, None)
-            }
-        };
+    let (
+        title,
+        track_artist,
+        album_artist,
+        album_name,
+        duration_ms,
+        embedded_artwork,
+        normalization_gain_metadata,
+    ) = match tagged {
+        Ok(tagged) => {
+            let tag = tagged.primary_tag().or_else(|| tagged.first_tag());
+            let title = tag
+                .and_then(|tag| tag.title())
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .unwrap_or(fallback_title);
+            let track_artist = tag
+                .and_then(|tag| tag.artist())
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty());
+            let album_artist = tag
+                .and_then(|tag| tag.get_string(&ItemKey::AlbumArtist))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+            let album_name = tag
+                .and_then(|tag| tag.album())
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty());
+            let duration = tagged.properties().duration().as_millis();
+            let duration_ms = (duration > 0).then_some(duration.min(u64::MAX as u128) as u64);
+            let embedded_artwork = tag
+                .and_then(|tag| tag.pictures().first())
+                .and_then(|picture| artwork.cache(picture.data()));
+            let normalization_gain_metadata = normalization_gain_metadata(tagged.tags().iter());
+            (
+                title,
+                track_artist,
+                album_artist,
+                album_name,
+                duration_ms,
+                embedded_artwork,
+                normalization_gain_metadata,
+            )
+        }
+        Err(error) => {
+            debug!(category = "LOCAL_LIBRARY", event = "metadata_fallback_used", path = %observation.canonical.display(), reason = %error);
+            (fallback_title, None, None, None, None, None, None)
+        }
+    };
 
     let display_artist = track_artist
         .as_deref()
@@ -256,9 +504,15 @@ fn scan_track(
         format!("local-album:{:x}", digest.finalize())
     });
 
-    let thumbnail_url = embedded_artwork.or_else(|| folder_artwork(&canonical, artwork));
+    let thumbnail_url = embedded_artwork.or_else(|| {
+        observation
+            .sidecar_artwork
+            .as_ref()
+            .and_then(|candidate| cache_folder_artwork(candidate, artwork))
+    });
 
     Ok(ScannedLocalTrack {
+        local_file_id: previous.and_then(|track| track.local_file_id),
         song: Song {
             id: song_id,
             title,
@@ -271,42 +525,164 @@ fn scan_track(
             duration_ms,
             thumbnail_url,
         },
-        canonical_path,
-        relative_path,
-        mime_type: mime_type.into(),
-        file_size_bytes,
-        modified_at_ms,
-        source_identity,
+        canonical_path: observation.canonical_path,
+        relative_path: observation.relative_path,
+        mime_type: observation.mime_type.into(),
+        file_size_bytes: observation.file_size_bytes,
+        modified_at_ms: observation.modified_at_ms,
+        modified_at_ns: observation.modified_at_ns,
+        source_identity: observation.source_identity,
+        sidecar_artwork_path: observation
+            .sidecar_artwork
+            .as_ref()
+            .map(|candidate| candidate.canonical_path.clone()),
+        sidecar_artwork_size_bytes: observation
+            .sidecar_artwork
+            .as_ref()
+            .map(|candidate| candidate.file_size_bytes),
+        sidecar_artwork_modified_at_ns: observation
+            .sidecar_artwork
+            .as_ref()
+            .and_then(|candidate| candidate.modified_at_ns),
+        normalization_gain_metadata,
         artist_names,
-        first_seen_at_ms,
+        first_seen_at_ms: previous.map_or(first_seen_at_ms, |track| track.first_seen_at_ms),
+        metadata_changed: true,
     })
 }
 
-fn folder_artwork(audio_path: &Path, artwork: &LocalArtworkStore) -> Option<String> {
-    let parent = audio_path.parent()?;
-    const STEMS: &[&str] = &["cover", "folder", "front", "album"];
-    const EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
-    let entries = std::fs::read_dir(parent).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        let stem = stem.to_ascii_lowercase();
-        let extension = extension.to_ascii_lowercase();
-        if !STEMS.contains(&stem.as_str()) || !EXTENSIONS.contains(&extension.as_str()) {
-            continue;
-        }
-        if let Ok(bytes) = std::fs::read(path) {
-            if let Some(cached) = artwork.cache(&bytes) {
-                return Some(cached);
+fn normalization_gain_metadata<'a>(
+    tags: impl IntoIterator<Item = &'a Tag>,
+) -> Option<NormalizationGainMetadata> {
+    let mut replay_gain = NormalizationGainMetadata::default();
+    let mut r128_track_gain = None;
+    let mut r128_album_gain = None;
+
+    for tag in tags {
+        for item in tag.items() {
+            let Some(value) = item.value().text() else {
+                continue;
+            };
+            match item.key() {
+                ItemKey::ReplayGainTrackGain => {
+                    replay_gain.track_gain_db =
+                        replay_gain.track_gain_db.or_else(|| parse_gain_db(value));
+                }
+                ItemKey::ReplayGainAlbumGain => {
+                    replay_gain.album_gain_db =
+                        replay_gain.album_gain_db.or_else(|| parse_gain_db(value));
+                }
+                ItemKey::ReplayGainTrackPeak => {
+                    replay_gain.track_peak = replay_gain.track_peak.or_else(|| parse_peak(value));
+                }
+                ItemKey::ReplayGainAlbumPeak => {
+                    replay_gain.album_peak = replay_gain.album_peak.or_else(|| parse_peak(value));
+                }
+                ItemKey::Unknown(key) => match canonical_gain_key(key).as_str() {
+                    "REPLAYGAINTRACKGAIN" => {
+                        replay_gain.track_gain_db =
+                            replay_gain.track_gain_db.or_else(|| parse_gain_db(value));
+                    }
+                    "REPLAYGAINALBUMGAIN" => {
+                        replay_gain.album_gain_db =
+                            replay_gain.album_gain_db.or_else(|| parse_gain_db(value));
+                    }
+                    "REPLAYGAINTRACKPEAK" => {
+                        replay_gain.track_peak =
+                            replay_gain.track_peak.or_else(|| parse_peak(value));
+                    }
+                    "REPLAYGAINALBUMPEAK" => {
+                        replay_gain.album_peak =
+                            replay_gain.album_peak.or_else(|| parse_peak(value));
+                    }
+                    "R128TRACKGAIN" => {
+                        r128_track_gain = r128_track_gain.or_else(|| parse_r128_gain(value));
+                    }
+                    "R128ALBUMGAIN" => {
+                        r128_album_gain = r128_album_gain.or_else(|| parse_r128_gain(value));
+                    }
+                    _ => {}
+                },
+                _ => {}
             }
         }
     }
-    None
+
+    replay_gain.track_gain_db = replay_gain.track_gain_db.or(r128_track_gain);
+    replay_gain.album_gain_db = replay_gain.album_gain_db.or(r128_album_gain);
+    (replay_gain != NormalizationGainMetadata::default()).then_some(replay_gain)
+}
+
+fn canonical_gain_key(key: &str) -> String {
+    key.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+fn parse_gain_db(value: &str) -> Option<f64> {
+    let value = value.trim();
+    let number = value
+        .get(..value.len().saturating_sub(2))
+        .filter(|_| {
+            value
+                .get(value.len().saturating_sub(2)..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case("db"))
+        })
+        .unwrap_or(value)
+        .trim();
+    let gain = number.parse::<f64>().ok()?;
+    gain.is_finite().then_some(gain)
+}
+
+fn parse_peak(value: &str) -> Option<f64> {
+    let peak = value.trim().parse::<f64>().ok()?;
+    (peak.is_finite() && peak > 0.0).then_some(peak)
+}
+
+fn parse_r128_gain(value: &str) -> Option<f64> {
+    let gain = value.trim().parse::<i32>().ok()?;
+    Some(f64::from(gain) / 256.0 + 5.0)
+}
+
+fn folder_artwork_candidate(audio_path: &Path) -> Option<SidecarArtwork> {
+    let parent = audio_path.parent()?;
+    const STEMS: &[&str] = &["cover", "folder", "front", "album"];
+    const EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
+    let mut candidates = std::fs::read_dir(parent)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let stem = path.file_stem()?.to_str()?.to_ascii_lowercase();
+            let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+            let stem_order = STEMS.iter().position(|candidate| *candidate == stem)?;
+            let extension_order = EXTENSIONS
+                .iter()
+                .position(|candidate| *candidate == extension)?;
+            Some((stem_order, extension_order, path))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.cmp(right));
+    candidates.into_iter().find_map(|(_, _, path)| {
+        let canonical = path.canonicalize().ok()?;
+        let metadata = canonical.metadata().ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        Some(SidecarArtwork {
+            canonical_path: canonical.to_str()?.to_owned(),
+            path: canonical,
+            file_size_bytes: metadata.len(),
+            modified_at_ns: metadata.modified().ok().and_then(system_time_ns),
+        })
+    })
+}
+
+fn cache_folder_artwork(candidate: &SidecarArtwork, artwork: &LocalArtworkStore) -> Option<String> {
+    std::fs::read(&candidate.path)
+        .ok()
+        .and_then(|bytes| artwork.cache(&bytes))
 }
 
 fn image_extension(bytes: &[u8]) -> Option<&'static str> {
@@ -386,29 +762,186 @@ fn supported_mime_type(path: &Path) -> Option<&'static str> {
     }
 }
 
-fn current_time_ms() -> i64 {
-    SystemTime::now()
+fn system_time_ms(value: SystemTime) -> Option<i64> {
+    value
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+}
+
+fn system_time_ns(value: SystemTime) -> Option<i64> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+}
+
+fn is_managed_artwork_file(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    stem.len() == 64
+        && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && matches!(extension, "jpg" | "png" | "webp")
+}
+
+fn current_time_ms() -> i64 {
+    system_time_ms(SystemTime::now()).unwrap_or(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        append_artist_credits, image_extension, normalize_lyrics, scan_directory,
-        supported_mime_type, LocalArtworkStore,
+        append_artist_credits, image_extension, normalization_gain_metadata, parse_gain_db,
+        parse_lyrics_text, parse_peak, read_embedded_lyrics, scan_directory, supported_mime_type,
+        LocalArtworkStore,
+    };
+    use lofty::{
+        file::TaggedFileExt,
+        tag::{ItemKey, ItemValue, Tag, TagExt, TagItem, TagType},
     };
     use solmusic_application::MusicDirectory;
     use std::{fs, path::Path};
 
+    fn test_directory(root: &Path) -> MusicDirectory {
+        MusicDirectory {
+            id: 1,
+            path: root.to_string_lossy().into_owned(),
+            added_at_ms: 1,
+            last_scanned_at_ms: None,
+            last_scan_attempt_at_ms: None,
+            status: "READY".into(),
+            last_error: None,
+            track_count: 0,
+        }
+    }
+
+    fn write_test_wav(path: &Path) {
+        let data_length = 8_000u32;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_length).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8_000u32.to_le_bytes());
+        wav.extend_from_slice(&8_000u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_length.to_le_bytes());
+        wav.resize(44 + data_length as usize, 128);
+        fs::write(path, wav).unwrap();
+    }
+
     #[test]
-    fn normalizes_embedded_lyrics_line_endings_and_whitespace() {
-        assert_eq!(
-            normalize_lyrics("  Line one\r\nLine two\r\n  ").as_deref(),
-            Some("Line one\nLine two")
-        );
-        assert_eq!(normalize_lyrics(" \r\n\t"), None);
+    fn parses_plain_and_timed_local_lyrics() {
+        let plain = parse_lyrics_text("  Line one\r\nLine two\r\n  ").unwrap();
+        assert_eq!(plain.text, "Line one\nLine two");
+        assert!(!plain.synchronized);
+        assert!(plain.lines.is_empty());
+        let timed = parse_lyrics_text("[00:01.50]First\n[00:03.000]Second").unwrap();
+        assert!(timed.synchronized);
+        assert_eq!(timed.lines[0].start_ms, 1_500);
+        assert_eq!(timed.lines[0].end_ms, Some(3_000));
+        assert_eq!(timed.lines[1].text, "Second");
+        assert!(parse_lyrics_text(" \r\n\t").is_none());
+    }
+
+    #[test]
+    fn reads_sidecar_lrc_before_audio_metadata() {
+        let root = std::env::temp_dir().join(format!("solmusic-lrc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let audio = root.join("song.mp3");
+        fs::write(&audio, b"not needed for sidecar lyrics").unwrap();
+        fs::write(root.join("song.lrc"), "[00:01.00]Sidecar line").unwrap();
+        let lyrics = read_embedded_lyrics(&audio).unwrap().unwrap();
+        assert!(lyrics.synchronized);
+        assert_eq!(lyrics.lines[0].text, "Sidecar line");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unreadable_sidecar_falls_back_to_embedded_lyrics() {
+        let root =
+            std::env::temp_dir().join(format!("solmusic-lrc-fallback-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let audio = root.join("song.wav");
+        let data_length = 8_000u32;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_length).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8_000u32.to_le_bytes());
+        wav.extend_from_slice(&8_000u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_length.to_le_bytes());
+        wav.resize(44 + data_length as usize, 128);
+        fs::write(&audio, wav).unwrap();
+
+        let tagged = lofty::read_from_path(&audio).unwrap();
+        let mut tag = Tag::new(tagged.primary_tag_type());
+        tag.insert_text(ItemKey::Lyrics, "Embedded fallback".into());
+        tag.save_to_path(&audio, lofty::config::WriteOptions::default())
+            .unwrap();
+        fs::write(root.join("song.lrc"), [0xff, 0xfe, 0xfd]).unwrap();
+
+        let lyrics = read_embedded_lyrics(&audio).unwrap().unwrap();
+        assert_eq!(lyrics.text, "Embedded fallback");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parses_replaygain_and_r128_metadata_without_inventing_values() {
+        let mut replay_gain = Tag::new(TagType::VorbisComments);
+        replay_gain.insert_text(ItemKey::ReplayGainTrackGain, " -7.25 dB ".into());
+        replay_gain.insert_unchecked(TagItem::new(
+            ItemKey::Unknown("replaygain-album-gain".into()),
+            ItemValue::Text("-6.5db".into()),
+        ));
+        replay_gain.insert_text(ItemKey::ReplayGainTrackPeak, "0.987654".into());
+        replay_gain.insert_text(ItemKey::ReplayGainAlbumPeak, "1.021".into());
+        replay_gain.insert_unchecked(TagItem::new(
+            ItemKey::Unknown("R128_TRACK_GAIN".into()),
+            ItemValue::Text("-2560".into()),
+        ));
+        let metadata = normalization_gain_metadata([&replay_gain]).unwrap();
+        assert_eq!(metadata.track_gain_db, Some(-7.25));
+        assert_eq!(metadata.album_gain_db, Some(-6.5));
+        assert_eq!(metadata.track_peak, Some(0.987654));
+        assert_eq!(metadata.album_peak, Some(1.021));
+
+        let mut r128 = Tag::new(TagType::VorbisComments);
+        r128.insert_unchecked(TagItem::new(
+            ItemKey::Unknown("r128 track gain".into()),
+            ItemValue::Text("-2560".into()),
+        ));
+        r128.insert_unchecked(TagItem::new(
+            ItemKey::Unknown("r128_album_gain".into()),
+            ItemValue::Text("-1280".into()),
+        ));
+        let metadata = normalization_gain_metadata([&r128]).unwrap();
+        assert_eq!(metadata.track_gain_db, Some(-5.0));
+        assert_eq!(metadata.album_gain_db, Some(0.0));
+        assert_eq!(metadata.track_peak, None);
+        assert_eq!(metadata.album_peak, None);
+
+        assert_eq!(parse_gain_db("+3 DB"), Some(3.0));
+        assert_eq!(parse_gain_db("not gain"), None);
+        assert_eq!(parse_peak("0"), None);
+        assert_eq!(parse_peak("NaN"), None);
+        assert!(normalization_gain_metadata(std::iter::empty::<&Tag>()).is_none());
     }
 
     #[test]
@@ -470,6 +1003,7 @@ mod tests {
                 track_count: 0,
             },
             &artwork,
+            &[],
         )
         .unwrap();
         assert_eq!(batch.tracks.len(), 1);
@@ -487,6 +1021,157 @@ mod tests {
             .thumbnail_url
             .as_deref()
             .is_some_and(|url| url.starts_with("local-artwork:")));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(artwork_root).unwrap();
+    }
+
+    #[test]
+    fn unchanged_rescan_reuses_persisted_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "solmusic-incremental-unchanged-{}",
+            std::process::id()
+        ));
+        let artwork_root = root.with_extension("artwork-cache");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&artwork_root);
+        fs::create_dir_all(&root).unwrap();
+        write_test_wav(&root.join("track.wav"));
+        let artwork = LocalArtworkStore::new(artwork_root.clone()).unwrap();
+
+        let first = scan_directory(&test_directory(&root), &artwork, &[]).unwrap();
+        assert!(first.tracks[0].metadata_changed);
+        let second = scan_directory(&test_directory(&root), &artwork, &first.tracks).unwrap();
+
+        assert_eq!(second.tracks.len(), 1);
+        assert!(!second.tracks[0].metadata_changed);
+        assert_eq!(second.tracks[0].song, first.tracks[0].song);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(artwork_root).unwrap();
+    }
+
+    #[test]
+    fn audio_metadata_edit_is_reindexed_without_changing_canonical_id() {
+        let root = std::env::temp_dir().join(format!(
+            "solmusic-incremental-metadata-{}",
+            std::process::id()
+        ));
+        let artwork_root = root.with_extension("artwork-cache");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&artwork_root);
+        fs::create_dir_all(&root).unwrap();
+        let audio = root.join("track.wav");
+        write_test_wav(&audio);
+        let artwork = LocalArtworkStore::new(artwork_root.clone()).unwrap();
+        let first = scan_directory(&test_directory(&root), &artwork, &[]).unwrap();
+
+        let tagged = lofty::read_from_path(&audio).unwrap();
+        let mut tag = Tag::new(tagged.primary_tag_type());
+        tag.insert_text(ItemKey::TrackTitle, "Edited title".into());
+        tag.save_to_path(&audio, lofty::config::WriteOptions::default())
+            .unwrap();
+        let second = scan_directory(&test_directory(&root), &artwork, &first.tracks).unwrap();
+
+        assert!(second.tracks[0].metadata_changed);
+        assert_eq!(second.tracks[0].song.id, first.tracks[0].song.id);
+        assert_eq!(second.tracks[0].song.title, "Edited title");
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(artwork_root).unwrap();
+    }
+
+    #[test]
+    fn rename_preserves_identity_and_skips_metadata_on_supported_filesystems() {
+        let root = std::env::temp_dir().join(format!(
+            "solmusic-incremental-rename-{}",
+            std::process::id()
+        ));
+        let artwork_root = root.with_extension("artwork-cache");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&artwork_root);
+        fs::create_dir_all(&root).unwrap();
+        let old_path = root.join("old.wav");
+        let new_path = root.join("new.wav");
+        write_test_wav(&old_path);
+        let artwork = LocalArtworkStore::new(artwork_root.clone()).unwrap();
+        let first = scan_directory(&test_directory(&root), &artwork, &[]).unwrap();
+        fs::rename(&old_path, &new_path).unwrap();
+
+        let second = scan_directory(&test_directory(&root), &artwork, &first.tracks).unwrap();
+        assert_eq!(second.tracks[0].song.id, first.tracks[0].song.id);
+        assert_eq!(second.tracks[0].canonical_path, new_path.to_str().unwrap());
+        #[cfg(unix)]
+        assert!(!second.tracks[0].metadata_changed);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(artwork_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_is_kept_as_a_duplicate_source_not_mistaken_for_a_rename() {
+        let root = std::env::temp_dir().join(format!(
+            "solmusic-incremental-hard-link-{}",
+            std::process::id()
+        ));
+        let artwork_root = root.with_extension("artwork-cache");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&artwork_root);
+        fs::create_dir_all(&root).unwrap();
+        let original = root.join("original.wav");
+        write_test_wav(&original);
+        let artwork = LocalArtworkStore::new(artwork_root.clone()).unwrap();
+        let first = scan_directory(&test_directory(&root), &artwork, &[]).unwrap();
+        fs::hard_link(&original, root.join("copy.wav")).unwrap();
+
+        let second = scan_directory(&test_directory(&root), &artwork, &first.tracks).unwrap();
+        assert_eq!(second.tracks.len(), 2);
+        assert_eq!(
+            second
+                .tracks
+                .iter()
+                .filter(|track| track.metadata_changed)
+                .count(),
+            1
+        );
+        assert!(second
+            .tracks
+            .iter()
+            .all(|track| track.song.id == first.tracks[0].song.id));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(artwork_root).unwrap();
+    }
+
+    #[test]
+    fn changed_sidecar_rebuilds_and_prunes_cached_artwork() {
+        let root =
+            std::env::temp_dir().join(format!("solmusic-incremental-cover-{}", std::process::id()));
+        let artwork_root = root.with_extension("artwork-cache");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&artwork_root);
+        fs::create_dir_all(&root).unwrap();
+        write_test_wav(&root.join("track.wav"));
+        let cover = root.join("cover.png");
+        fs::write(&cover, b"\x89PNG\r\n\x1a\nfirst").unwrap();
+        let artwork = LocalArtworkStore::new(artwork_root.clone()).unwrap();
+        let first = scan_directory(&test_directory(&root), &artwork, &[]).unwrap();
+        let first_marker = first.tracks[0].song.thumbnail_url.clone().unwrap();
+
+        fs::write(&cover, b"\x89PNG\r\n\x1a\na different cover").unwrap();
+        let second = scan_directory(&test_directory(&root), &artwork, &first.tracks).unwrap();
+        let second_marker = second.tracks[0].song.thumbnail_url.clone().unwrap();
+        assert!(second.tracks[0].metadata_changed);
+        assert_ne!(second_marker, first_marker);
+
+        assert_eq!(
+            artwork.prune(std::slice::from_ref(&second_marker)).unwrap(),
+            1
+        );
+        assert!(!Path::new(first_marker.trim_start_matches("local-artwork:")).exists());
+        assert!(Path::new(second_marker.trim_start_matches("local-artwork:")).exists());
+
+        fs::remove_file(&cover).unwrap();
+        let third = scan_directory(&test_directory(&root), &artwork, &second.tracks).unwrap();
+        assert!(third.tracks[0].metadata_changed);
+        assert_eq!(third.tracks[0].song.thumbnail_url, None);
+        assert_eq!(artwork.prune(&[]).unwrap(), 1);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(artwork_root).unwrap();
     }

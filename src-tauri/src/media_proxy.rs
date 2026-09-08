@@ -26,7 +26,7 @@ use tokio_util::io::ReaderStream;
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use crate::dto::PlaybackPreparationDto;
+use crate::dto::{PlaybackPreparationDto, PlaybackSourceDto};
 
 const WEB_PLAYBACK_USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36";
@@ -42,6 +42,7 @@ pub struct MediaProxy {
     base_url: String,
     sources: Mutex<SourceRegistry>,
     cache_dir: PathBuf,
+    local_image_root: PathBuf,
 }
 
 #[derive(Default)]
@@ -49,6 +50,13 @@ struct SourceRegistry {
     by_token: HashMap<String, RegisteredSource>,
     order: VecDeque<String>,
     by_song: HashMap<String, Arc<RemoteEntry>>,
+    by_image: HashMap<ImageSourceKey, String>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum ImageSourceKey {
+    Local(PathBuf),
+    Remote(String),
 }
 
 #[derive(Clone)]
@@ -79,7 +87,7 @@ struct DownloadStatus {
 }
 
 impl MediaProxy {
-    pub fn start(cache_dir: PathBuf) -> Result<Arc<Self>, String> {
+    pub fn start(cache_dir: PathBuf, local_image_root: PathBuf) -> Result<Arc<Self>, String> {
         let listener = StdTcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .map_err(|error| format!("could not bind media proxy: {error}"))?;
         listener
@@ -96,6 +104,11 @@ impl MediaProxy {
         }
         std::fs::create_dir_all(&cache_dir)
             .map_err(|error| format!("could not create media cache: {error}"))?;
+        std::fs::create_dir_all(&local_image_root)
+            .map_err(|error| format!("could not create artwork cache: {error}"))?;
+        let local_image_root = local_image_root
+            .canonicalize()
+            .map_err(|error| format!("could not canonicalize artwork cache: {error}"))?;
         let proxy = Arc::new(Self {
             client: Client::builder()
                 .user_agent(WEB_PLAYBACK_USER_AGENT)
@@ -106,6 +119,7 @@ impl MediaProxy {
             base_url: format!("http://{address}"),
             sources: Mutex::new(SourceRegistry::default()),
             cache_dir,
+            local_image_root,
         });
 
         let server_proxy = Arc::clone(&proxy);
@@ -134,13 +148,30 @@ impl MediaProxy {
         request_profile: PlaybackRequestProfile,
         force_new_remote: bool,
     ) -> Result<(), String> {
-        let token = Uuid::new_v4().simple().to_string();
         let song_id = preparation
             .state
             .current
             .as_ref()
             .map(|song| song.id.clone())
-            .unwrap_or_else(|| token.clone());
+            .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+        self.register_source(
+            &mut preparation.source,
+            &song_id,
+            local_path,
+            request_profile,
+            force_new_remote,
+        )
+    }
+
+    pub fn register_source(
+        &self,
+        playback_source: &mut PlaybackSourceDto,
+        song_id: &str,
+        local_path: Option<PathBuf>,
+        request_profile: PlaybackRequestProfile,
+        force_new_remote: bool,
+    ) -> Result<(), String> {
+        let token = Uuid::new_v4().simple().to_string();
         let mut registry = self
             .sources
             .lock()
@@ -149,11 +180,11 @@ impl MediaProxy {
             Some(path) => SourceLocation::Local(path),
             None => {
                 if force_new_remote {
-                    if let Some(existing) = registry.by_song.get(&song_id) {
+                    if let Some(existing) = registry.by_song.get(song_id) {
                         existing.cancelled.store(true, Ordering::Relaxed);
                     }
                 }
-                let reusable = registry.by_song.get(&song_id).filter(|entry| {
+                let reusable = registry.by_song.get(song_id).filter(|entry| {
                     let status = entry.status.borrow();
                     !force_new_remote
                         && status.error.is_none()
@@ -163,11 +194,11 @@ impl MediaProxy {
                     Arc::clone(entry)
                 } else {
                     for (cached_song, entry) in &registry.by_song {
-                        if cached_song != &song_id && !entry.status.borrow().complete {
+                        if cached_song != song_id && !entry.status.borrow().complete {
                             entry.cancelled.store(true, Ordering::Relaxed);
                         }
                     }
-                    let url = std::mem::take(&mut preparation.source.url);
+                    let url = std::mem::take(&mut playback_source.url);
                     let path = self.cache_dir.join(format!("{token}.part"));
                     let (status_tx, status_rx) = watch::channel(DownloadStatus::default());
                     let cancelled = Arc::new(AtomicBool::new(false));
@@ -188,7 +219,9 @@ impl MediaProxy {
                         )
                         .await;
                     });
-                    registry.by_song.insert(song_id.clone(), Arc::clone(&entry));
+                    registry
+                        .by_song
+                        .insert(song_id.to_owned(), Arc::clone(&entry));
                     entry
                 };
                 SourceLocation::Remote(entry)
@@ -196,37 +229,72 @@ impl MediaProxy {
         };
         let source = RegisteredSource {
             location,
-            mime_type: preparation.source.mime_type.clone(),
+            mime_type: playback_source.mime_type.clone(),
         };
         registry.by_token.insert(token.clone(), source);
         registry.order.push_back(token.clone());
         while registry.order.len() > MAX_REGISTERED_SOURCES {
             if let Some(expired) = registry.order.pop_front() {
                 registry.by_token.remove(&expired);
+                registry.by_image.retain(|_, token| token != &expired);
             }
         }
-        preparation.source.url = format!("{}/media/{token}", self.base_url);
+        playback_source.url = format!("{}/media/{token}", self.base_url);
         Ok(())
     }
 
-    pub fn register_image(&self, url: String) -> Result<String, String> {
-        let token = Uuid::new_v4().simple().to_string();
+    pub fn register_local_image(&self, marker: &str) -> Result<Option<String>, String> {
+        let Some(raw_path) = marker.strip_prefix("local-artwork:") else {
+            return Ok(None);
+        };
+        let (path, mime_type) = resolve_local_image(&self.local_image_root, raw_path)?;
+        let key = ImageSourceKey::Local(path.clone());
         let source = RegisteredSource {
-            location: SourceLocation::DirectRemote(url),
+            location: SourceLocation::Local(path),
+            mime_type: mime_type.into(),
+        };
+        let token = self.register_image_source(key, source)?;
+        Ok(Some(format!("{}/media/{token}", self.base_url)))
+    }
+
+    pub fn register_image(&self, url: String) -> Result<String, String> {
+        let canonical_url = reqwest::Url::parse(&url)
+            .map_err(|error| format!("invalid remote artwork URL: {error}"))?
+            .to_string();
+        let key = ImageSourceKey::Remote(canonical_url.clone());
+        let source = RegisteredSource {
+            location: SourceLocation::DirectRemote(canonical_url),
             mime_type: "image/*".into(),
         };
+        let token = self.register_image_source(key, source)?;
+        Ok(format!("{}/media/{token}", self.base_url))
+    }
+
+    fn register_image_source(
+        &self,
+        key: ImageSourceKey,
+        source: RegisteredSource,
+    ) -> Result<String, String> {
         let mut registry = self
             .sources
             .lock()
             .map_err(|_| "media proxy registry was poisoned".to_owned())?;
+        if let Some(token) = registry.by_image.get(&key) {
+            if registry.by_token.contains_key(token) {
+                return Ok(token.clone());
+            }
+        }
+        let token = Uuid::new_v4().simple().to_string();
         registry.by_token.insert(token.clone(), source);
+        registry.by_image.insert(key, token.clone());
         registry.order.push_back(token.clone());
         while registry.order.len() > MAX_REGISTERED_SOURCES {
             if let Some(expired) = registry.order.pop_front() {
                 registry.by_token.remove(&expired);
+                registry.by_image.retain(|_, token| token != &expired);
             }
         }
-        Ok(format!("{}/media/{token}", self.base_url))
+        Ok(token)
     }
 
     pub async fn download_url_to_path(
@@ -814,6 +882,30 @@ async fn serve_local_file(
     })
 }
 
+fn resolve_local_image(
+    root: &std::path::Path,
+    raw_path: &str,
+) -> Result<(PathBuf, &'static str), String> {
+    let path = PathBuf::from(raw_path)
+        .canonicalize()
+        .map_err(|error| format!("local artwork is unavailable: {error}"))?;
+    if !path.starts_with(root) || !path.is_file() {
+        return Err("local artwork escaped the managed artwork cache".into());
+    }
+    let mime_type = image_mime_type(&path)
+        .ok_or_else(|| "local artwork has an unsupported image type".to_owned())?;
+    Ok((path, mime_type))
+}
+
+fn image_mime_type(path: &std::path::Path) -> Option<&'static str> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
 fn parse_local_range(value: &str) -> Option<(u64, Option<u64>)> {
     let (start, end) = value.strip_prefix("bytes=")?.split_once('-')?;
     let start = start.parse().ok()?;
@@ -857,6 +949,71 @@ fn proxy_error(status: StatusCode, message: impl Into<String>) -> (StatusCode, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_images_are_canonicalized_and_contained() {
+        let base = std::env::temp_dir().join(format!("solmusic-artwork-test-{}", Uuid::new_v4()));
+        let root = base.join("managed");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let inside = root.join("cover.png");
+        let outside = base.join("outside.png");
+        std::fs::write(&inside, b"image").unwrap();
+        std::fs::write(&outside, b"image").unwrap();
+        let resolved = resolve_local_image(&root, inside.to_str().unwrap()).unwrap();
+        assert_eq!(resolved.0, inside);
+        assert_eq!(resolved.1, "image/png");
+        assert!(resolve_local_image(&root, outside.to_str().unwrap()).is_err());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn image_registration_reuses_tokens_and_stays_bounded() {
+        let base = std::env::temp_dir().join(format!("solmusic-image-registry-{}", Uuid::new_v4()));
+        let root = base.join("managed");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let local = root.join("cover.png");
+        std::fs::write(&local, b"image").unwrap();
+        let proxy = MediaProxy {
+            client: Client::new(),
+            base_url: "http://proxy.test".into(),
+            sources: Mutex::new(SourceRegistry::default()),
+            cache_dir: base.join("cache"),
+            local_image_root: root,
+        };
+
+        let marker = format!("local-artwork:{}", local.display());
+        let first_local = proxy.register_local_image(&marker).unwrap().unwrap();
+        assert_eq!(
+            proxy.register_local_image(&marker).unwrap().unwrap(),
+            first_local
+        );
+        let first_remote = proxy
+            .register_image("HTTPS://EXAMPLE.TEST/cover.jpg".into())
+            .unwrap();
+        for _ in 0..MAX_REGISTERED_SOURCES * 2 {
+            assert_eq!(
+                proxy
+                    .register_image("https://example.test/cover.jpg".into())
+                    .unwrap(),
+                first_remote
+            );
+        }
+        assert_eq!(proxy.sources.lock().unwrap().by_token.len(), 2);
+
+        for index in 0..=MAX_REGISTERED_SOURCES {
+            proxy
+                .register_image(format!("https://example.test/{index}.jpg"))
+                .unwrap();
+        }
+        let registry = proxy.sources.lock().unwrap();
+        assert_eq!(registry.by_token.len(), MAX_REGISTERED_SOURCES);
+        assert_eq!(registry.order.len(), MAX_REGISTERED_SOURCES);
+        assert!(registry.by_image.len() <= MAX_REGISTERED_SOURCES);
+        drop(registry);
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn parses_total_length_from_content_range() {
@@ -1031,6 +1188,7 @@ mod tests {
                 base_url: String::new(),
                 sources: Mutex::new(registry),
                 cache_dir: std::env::temp_dir(),
+                local_image_root: std::env::temp_dir(),
             };
             let mut headers = HeaderMap::new();
             headers.insert(header::RANGE, "bytes=0-".parse().unwrap());

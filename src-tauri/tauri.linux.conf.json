@@ -2,6 +2,11 @@
 	"$schema": "https://schema.tauri.app/config/2",
 	"identifier": "app.solmusic",
 	"bundle": {
-		"externalBin": ["binaries/yt-dlp"]
+		"externalBin": ["binaries/yt-dlp"],
+		"linux": {
+			"appimage": {
+				"bundleMediaFramework": true
+			}
+		}
 	}
 }

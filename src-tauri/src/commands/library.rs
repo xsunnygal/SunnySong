@@ -29,6 +29,29 @@ fn current_time_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn prune_artwork(app: &SunnySongApp, artwork: &LocalArtworkStore) {
+    match app.referenced_local_artwork() {
+        Ok(referenced) => match artwork.prune(&referenced) {
+            Ok(removed) if removed > 0 => info!(
+                category = "LOCAL_LIBRARY",
+                event = "stale_artwork_pruned",
+                removed
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                category = "LOCAL_LIBRARY",
+                event = "stale_artwork_prune_failed",
+                reason = %error
+            ),
+        },
+        Err(error) => tracing::warn!(
+            category = "LOCAL_LIBRARY",
+            event = "artwork_references_failed",
+            reason = %error
+        ),
+    }
+}
+
 #[tauri::command]
 pub fn get_discovery_enabled(app: State<'_, SunnySongApp>) -> Result<bool, String> {
     app.discovery_enabled().map_err(error)
@@ -84,9 +107,13 @@ pub async fn add_music_directory(
     let attempted_at_ms = current_time_ms();
     app.set_music_directory_status(directory.id, "SCANNING", None, attempted_at_ms)
         .map_err(error)?;
+    let previous = app.local_scan_state(directory.id).map_err(error)?;
     let scan_target = directory.clone();
-    let artwork = artwork.inner().clone();
-    match tauri::async_runtime::spawn_blocking(move || scan_directory(&scan_target, &artwork)).await
+    let artwork_store = artwork.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        scan_directory(&scan_target, &artwork_store, &previous)
+    })
+    .await
     {
         Ok(Ok(batch)) => {
             app.store_directory_scan(
@@ -98,6 +125,7 @@ pub async fn add_music_directory(
                 batch.duration_ms,
             )
             .map_err(error)?;
+            prune_artwork(&app, &artwork);
         }
         Ok(Err(scan_error)) => {
             tracing::warn!(category = "SCANNER", event = "directory_scan_unavailable", directory_id = directory.id, reason = %scan_error);
@@ -137,9 +165,12 @@ pub async fn add_music_directory(
 #[tauri::command]
 pub fn remove_music_directory(
     app: State<'_, SunnySongApp>,
+    artwork: State<'_, LocalArtworkStore>,
     directory_id: i64,
 ) -> Result<(), String> {
-    app.remove_music_directory(directory_id).map_err(error)
+    app.remove_music_directory(directory_id).map_err(error)?;
+    prune_artwork(&app, &artwork);
+    Ok(())
 }
 
 #[tauri::command]
@@ -152,10 +183,13 @@ pub async fn rescan_music_library(
         let attempted_at_ms = current_time_ms();
         app.set_music_directory_status(directory.id, "SCANNING", None, attempted_at_ms)
             .map_err(error)?;
+        let previous = app.local_scan_state(directory.id).map_err(error)?;
         let scan_target = directory.clone();
-        let artwork = artwork.inner().clone();
-        match tauri::async_runtime::spawn_blocking(move || scan_directory(&scan_target, &artwork))
-            .await
+        let artwork_store = artwork.inner().clone();
+        match tauri::async_runtime::spawn_blocking(move || {
+            scan_directory(&scan_target, &artwork_store, &previous)
+        })
+        .await
         {
             Ok(Ok(batch)) => {
                 let report = app
@@ -183,6 +217,7 @@ pub async fn rescan_music_library(
                     directory_id: directory.id,
                     status: "UNAVAILABLE".into(),
                     indexed_tracks: 0,
+                    unchanged_tracks: 0,
                     unavailable_tracks: directory.track_count as usize,
                     skipped_files: 0,
                     duration_ms: 0,
@@ -202,6 +237,7 @@ pub async fn rescan_music_library(
                     directory_id: directory.id,
                     status: "ERROR".into(),
                     indexed_tracks: 0,
+                    unchanged_tracks: 0,
                     unavailable_tracks: directory.track_count as usize,
                     skipped_files: 0,
                     duration_ms: 0,
@@ -210,6 +246,7 @@ pub async fn rescan_music_library(
             }
         }
     }
+    prune_artwork(&app, &artwork);
     Ok(reports)
 }
 
@@ -243,7 +280,9 @@ pub(crate) fn proxy_artwork(
     let Some(marker) = artwork.as_deref() else {
         return Ok(());
     };
-    if let Some(url) = jellyfin.resolve_artwork_url(marker)? {
+    if let Some(url) = media_proxy.register_local_image(marker)? {
+        *artwork = Some(url);
+    } else if let Some(url) = jellyfin.resolve_artwork_url(marker)? {
         *artwork = Some(media_proxy.register_image(url)?);
     }
     Ok(())
@@ -321,9 +360,18 @@ pub fn get_library_folders(app: State<'_, SunnySongApp>) -> Result<Vec<LibraryFo
 #[tauri::command]
 pub fn search_local_music(
     app: State<'_, SunnySongApp>,
+    jellyfin: State<'_, Arc<JellyfinService>>,
+    media_proxy: State<'_, Arc<MediaProxy>>,
     query: String,
 ) -> Result<Vec<SongDto>, String> {
-    app.search_local(query.trim(), 100)
-        .map(|songs| songs.iter().map(SongDto::from).collect())
-        .map_err(error)
+    let mut songs = app
+        .search_local(query.trim(), 100)
+        .map_err(error)?
+        .iter()
+        .map(SongDto::from)
+        .collect::<Vec<_>>();
+    for song in &mut songs {
+        proxy_artwork(&mut song.thumbnail_url, &jellyfin, &media_proxy)?;
+    }
+    Ok(songs)
 }

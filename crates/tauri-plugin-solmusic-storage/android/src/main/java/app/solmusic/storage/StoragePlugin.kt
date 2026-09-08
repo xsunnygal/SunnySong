@@ -45,6 +45,16 @@ class SecretKeyArgs {
 }
 
 @InvokeArg
+class MediaSessionItemArgs {
+    var id: String = ""
+    var title: String = ""
+    var artist: String = ""
+    var album: String? = null
+    var artworkUrl: String? = null
+    var durationMs: Long = 0
+}
+
+@InvokeArg
 class MediaSessionArgs {
     var active: Boolean = false
     var title: String = ""
@@ -56,6 +66,9 @@ class MediaSessionArgs {
     var durationMs: Long = 0
     var canGoPrevious: Boolean = false
     var canGoNext: Boolean = false
+    var queue: List<MediaSessionItemArgs> = emptyList()
+    var currentItem: MediaSessionItemArgs? = null
+    var currentIndex: Int? = null
 }
 
 @TauriPlugin
@@ -236,8 +249,13 @@ class StoragePlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject(error.message ?: "Invalid media session update")
             return
         }
-        val intent = Intent(activity, PlaybackService::class.java).apply {
-            action = PlaybackService.ACTION_UPDATE
+        if (args.currentItem != null || args.queue.isNotEmpty()) {
+            BrowseSnapshotStore.save(
+                activity,
+                BrowseSnapshotStore.create(args.queue, args.currentItem, args.currentIndex),
+            )
+        }
+        val intent = PlaybackService.authorizedIntent(activity, PlaybackService.ACTION_UPDATE).apply {
             putExtra(PlaybackService.EXTRA_ACTIVE, args.active)
             putExtra(PlaybackService.EXTRA_TITLE, args.title)
             putExtra(PlaybackService.EXTRA_ARTIST, args.artist)
@@ -301,13 +319,16 @@ class StoragePlugin(private val activity: Activity) : Plugin(activity) {
                 while (pendingMediaControls.isNotEmpty()) add(pendingMediaControls.removeFirst())
             }
         }
-        for ((action, positionMs) in controls) triggerMediaControl(action, positionMs)
+        for (control in controls) triggerMediaControl(control)
     }
 
-    private fun triggerMediaControl(action: String, positionMs: Long?) {
+    private fun triggerMediaControl(control: PendingMediaControl) {
         val payload = JSObject().apply {
-            put("action", action)
-            if (positionMs != null) put("positionMs", positionMs)
+            put("action", control.action)
+            if (control.positionMs != null) put("positionMs", control.positionMs)
+            if (control.mediaId != null) put("mediaId", control.mediaId)
+            if (control.songId != null) put("songId", control.songId)
+            if (control.queueIndex != null) put("queueIndex", control.queueIndex)
         }
         trigger(MEDIA_CONTROL_EVENT, payload)
     }
@@ -321,31 +342,46 @@ class StoragePlugin(private val activity: Activity) : Plugin(activity) {
         private const val GCM_IV_BYTES = 12
         private const val GCM_TAG_BITS = 128
 
+        private data class PendingMediaControl(
+            val action: String,
+            val positionMs: Long? = null,
+            val mediaId: String? = null,
+            val songId: String? = null,
+            val queueIndex: Int? = null,
+        )
+
         @Volatile
         private var currentPlugin: StoragePlugin? = null
-        private val pendingMediaControls = ArrayDeque<Pair<String, Long?>>()
+        private val pendingMediaControls = ArrayDeque<PendingMediaControl>()
 
-        fun dispatchMediaControl(action: String, positionMs: Long? = null) {
+        fun dispatchMediaControl(
+            action: String,
+            positionMs: Long? = null,
+            mediaId: String? = null,
+            songId: String? = null,
+            queueIndex: Int? = null,
+        ) {
+            val control = PendingMediaControl(action, positionMs, mediaId, songId, queueIndex)
             val plugin = currentPlugin
             if (plugin == null) {
-                enqueueMediaControl(action, positionMs)
+                enqueueMediaControl(control)
                 return
             }
             plugin.activity.runOnUiThread {
                 if (plugin.hasListener(MEDIA_CONTROL_EVENT)) {
-                    plugin.triggerMediaControl(action, positionMs)
+                    plugin.triggerMediaControl(control)
                 } else {
-                    enqueueMediaControl(action, positionMs)
+                    enqueueMediaControl(control)
                 }
             }
         }
 
-        private fun enqueueMediaControl(action: String, positionMs: Long?) {
+        private fun enqueueMediaControl(control: PendingMediaControl) {
             synchronized(pendingMediaControls) {
                 while (pendingMediaControls.size >= MAX_PENDING_MEDIA_CONTROLS) {
                     pendingMediaControls.removeFirst()
                 }
-                pendingMediaControls.addLast(action to positionMs)
+                pendingMediaControls.addLast(control)
             }
         }
     }

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="playback_service_name">SunnySong playback</string>
+    <string name="playback_channel_name">Music playback</string>
+    <string name="playback_channel_description">Playback controls for SunnySong</string>
+    <string name="playback_play">Play</string>
+    <string name="playback_pause">Pause</string>
+    <string name="playback_previous">Previous</string>
+    <string name="playback_next">Next</string>
+    <string name="auto_queue">Queue</string>
+    <string name="auto_resume">Resume</string>
+</resources>

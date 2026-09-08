@@ -7,6 +7,7 @@ import {
 	type Song,
 } from "$lib/api/backend";
 import { library } from "$lib/features/library/library.svelte";
+import { revisions } from "$lib/features/revisions.svelte";
 
 const ANDROID_DIRECTORIES_KEY = "solmusic-android-download-directories";
 
@@ -28,6 +29,7 @@ class DownloadController {
 	}
 
 	async request(song: Song) {
+		if (this.loading) return;
 		this.song = song;
 		this.open = true;
 		this.error = null;
@@ -84,23 +86,30 @@ class DownloadController {
 			this.error = "Add or choose a local music folder first.";
 			return;
 		}
+		const song = this.song;
+		const isAndroid = this.isAndroid;
+		const directoryId = this.selectedDirectoryId;
+		const androidUri = this.selectedAndroidUri;
 		this.loading = true;
 		this.error = null;
 		this.message = "Downloading audio and writing metadata…";
 		let completed = false;
+		revisions.downloadsChanged();
 		try {
 			const result = await downloadSong(
-				this.song,
-				this.isAndroid ? null : this.selectedDirectoryId,
-				this.isAndroid ? this.selectedAndroidUri : null,
+				song,
+				isAndroid ? null : directoryId,
+				isAndroid ? androidUri : null,
 			);
 			this.message = `${result.fileName} was downloaded.`;
-			if (!this.isAndroid) library.version += 1;
+			if (!isAndroid) library.version += 1;
+			revisions.libraryChanged();
 			completed = true;
 		} catch (error) {
 			this.error = error instanceof Error ? error.message : String(error);
 			this.message = null;
 		} finally {
+			revisions.downloadsChanged();
 			this.loading = false;
 			if (completed) {
 				this.open = false;

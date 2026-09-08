@@ -48,6 +48,14 @@ pub struct PlaybackPreparation {
     pub state: PlaybackState,
 }
 
+#[derive(Debug, Clone)]
+pub struct DiscoverSection {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub items: Vec<RecommendedSong>,
+}
+
 pub struct SunnySongApp {
     provider: Arc<dyn MusicProvider>,
     repository: Arc<dyn MusicRepository>,
@@ -110,6 +118,7 @@ impl SunnySongApp {
                 expires_at_ms: None,
                 local_path: Some(local.path),
                 request_profile: PlaybackRequestProfile::Web,
+                normalization_gain_metadata: local.normalization_gain_metadata,
             });
         }
         if song.id.as_str().starts_with("jellyfin:") {
@@ -186,11 +195,15 @@ impl SunnySongApp {
         }
 
         let mut seen = HashSet::from([current.id.as_str().to_owned()]);
+        let mut seen_families = HashSet::from([song_family_key(&current)]);
         let mut queue = vec![current];
         queue.extend(
             candidates
                 .into_iter()
-                .filter(|candidate| seen.insert(candidate.id.as_str().to_owned()))
+                .filter(|candidate| {
+                    seen.insert(candidate.id.as_str().to_owned())
+                        && seen_families.insert(song_family_key(candidate))
+                })
                 .take(20),
         );
         state.queue = queue;
@@ -251,9 +264,17 @@ impl SunnySongApp {
             .iter()
             .map(|song| song.id.as_str().to_owned())
             .collect::<HashSet<_>>();
+        let mut seen_families = state
+            .queue
+            .iter()
+            .map(song_family_key)
+            .collect::<HashSet<_>>();
         let additions = candidates
             .into_iter()
-            .filter(|candidate| seen.insert(candidate.id.as_str().to_owned()))
+            .filter(|candidate| {
+                seen.insert(candidate.id.as_str().to_owned())
+                    && seen_families.insert(song_family_key(candidate))
+            })
             .take(count)
             .collect::<Vec<_>>();
         let added = additions.len();
@@ -267,6 +288,134 @@ impl SunnySongApp {
             recent_context_count = recent.len()
         );
         Ok(state.clone())
+    }
+
+    pub fn enqueue_next(&self, song: Song) -> Result<PlaybackState, AppError> {
+        self.repository.save_songs(std::slice::from_ref(&song))?;
+        let mut state = self.playback.lock().expect("playback state poisoned");
+        let mut current = state.current_index.ok_or(AppError::EmptyQueue)?;
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|item| item.id == song.id)
+        {
+            return Ok(state.clone());
+        }
+        if let Some(existing) = state
+            .queue
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| (item.id == song.id).then_some(index))
+        {
+            state.queue.remove(existing);
+            if existing < current {
+                current -= 1;
+                state.current_index = Some(current);
+            }
+        }
+        let insertion = (current + 1).min(state.queue.len());
+        state.queue.insert(insertion, song);
+        Ok(state.clone())
+    }
+
+    pub fn enqueue_song(&self, song: Song) -> Result<PlaybackState, AppError> {
+        self.repository.save_songs(std::slice::from_ref(&song))?;
+        let mut state = self.playback.lock().expect("playback state poisoned");
+        if state.queue.iter().all(|item| item.id != song.id) {
+            state.queue.push(song);
+        }
+        Ok(state.clone())
+    }
+
+    pub fn remove_queue_item(&self, index: usize) -> Result<PlaybackState, AppError> {
+        let mut state = self.playback.lock().expect("playback state poisoned");
+        let current = state.current_index.ok_or(AppError::EmptyQueue)?;
+        if index >= state.queue.len() {
+            return Err(AppError::InvalidQueueOperation(
+                "queue index is out of bounds".into(),
+            ));
+        }
+        if index == current {
+            return Err(AppError::InvalidQueueOperation(
+                "the currently playing item cannot be removed".into(),
+            ));
+        }
+        state.queue.remove(index);
+        if index < current {
+            state.current_index = Some(current - 1);
+        }
+        Ok(state.clone())
+    }
+
+    pub fn move_queue_item(&self, from: usize, to: usize) -> Result<PlaybackState, AppError> {
+        let mut state = self.playback.lock().expect("playback state poisoned");
+        if from >= state.queue.len() || to >= state.queue.len() {
+            return Err(AppError::InvalidQueueOperation(
+                "queue index is out of bounds".into(),
+            ));
+        }
+        if from == to {
+            return Ok(state.clone());
+        }
+        let current = state.current_index.ok_or(AppError::EmptyQueue)?;
+        let item = state.queue.remove(from);
+        state.queue.insert(to, item);
+        state.current_index = Some(if current == from {
+            to
+        } else if from < current && to >= current {
+            current - 1
+        } else if from > current && to <= current {
+            current + 1
+        } else {
+            current
+        });
+        state.current = state
+            .current_index
+            .and_then(|index| state.queue.get(index).cloned());
+        Ok(state.clone())
+    }
+
+    pub fn clear_upcoming(&self) -> Result<PlaybackState, AppError> {
+        let mut state = self.playback.lock().expect("playback state poisoned");
+        let current = state.current_index.ok_or(AppError::EmptyQueue)?;
+        state.queue.truncate(current + 1);
+        Ok(state.clone())
+    }
+
+    pub async fn replace_queue(
+        &self,
+        songs: Vec<Song>,
+        start_index: usize,
+    ) -> Result<PlaybackPreparation, AppError> {
+        if songs.is_empty() || start_index >= songs.len() {
+            return Err(AppError::InvalidQueueOperation(
+                "replacement queue and start index are invalid".into(),
+            ));
+        }
+        let selected_id = songs[start_index].id.clone();
+        let mut seen = HashSet::new();
+        let queue = songs
+            .into_iter()
+            .filter(|song| seen.insert(song.id.as_str().to_owned()))
+            .collect::<Vec<_>>();
+        let current_index = queue
+            .iter()
+            .position(|song| song.id == selected_id)
+            .ok_or_else(|| AppError::InvalidQueueOperation("selected song was removed".into()))?;
+        self.repository.save_songs(&queue)?;
+        let current = queue[current_index].clone();
+        let generation = self.playback_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let source = self.resolve_source(&current.id, false).await?;
+        if self.playback_generation.load(Ordering::SeqCst) != generation {
+            return Err(AppError::StalePlaybackOperation);
+        }
+        let state = PlaybackState {
+            current: Some(current),
+            queue,
+            current_index: Some(current_index),
+        };
+        *self.playback.lock().expect("playback state poisoned") = state.clone();
+        Ok(PlaybackPreparation { source, state })
     }
 
     pub async fn play_queue_item(
@@ -367,7 +516,10 @@ impl SunnySongApp {
             .current
             .as_ref()
             .map(|current| current.id.as_str().to_owned());
-        if state.current_index != Some(original_index) || current_song_id != original_song_id {
+        if state.current_index != Some(original_index)
+            || current_song_id != original_song_id
+            || state.queue.get(target_index).map(|item| &item.id) != Some(&song.id)
+        {
             warn!(
                 category = "QUEUE",
                 event = "queue_changed_during_resolution",
@@ -403,6 +555,50 @@ impl SunnySongApp {
         Ok(())
     }
 
+    pub async fn prepare_next_playback_source(
+        &self,
+        song_id: &solmusic_domain::SongId,
+    ) -> Result<PlaybackSource, AppError> {
+        let (current_index, current_song_id) = {
+            let state = self.playback.lock().expect("playback state poisoned");
+            let current_index = state.current_index.ok_or(AppError::EmptyQueue)?;
+            let is_next = state
+                .queue
+                .get(current_index + 1)
+                .is_some_and(|song| &song.id == song_id);
+            if !is_next {
+                return Err(AppError::InvalidQueueOperation(
+                    "the requested song is not next in the current queue".into(),
+                ));
+            }
+            let current_song_id = state
+                .current
+                .as_ref()
+                .map(|song| song.id.as_str().to_owned());
+            (current_index, current_song_id)
+        };
+
+        let started = Instant::now();
+        let source = self.resolve_source(song_id, false).await?;
+        let state = self.playback.lock().expect("playback state poisoned");
+        let unchanged = state.current_index == Some(current_index)
+            && state.current.as_ref().map(|song| song.id.as_str()) == current_song_id.as_deref()
+            && state
+                .queue
+                .get(current_index + 1)
+                .is_some_and(|song| &song.id == song_id);
+        if !unchanged {
+            return Err(AppError::StalePlaybackOperation);
+        }
+        debug!(
+            category = "PLAYER",
+            event = "next_playback_source_prepared",
+            track_id = song_id.as_str(),
+            duration_ms = started.elapsed().as_millis() as u64
+        );
+        Ok(source)
+    }
+
     pub async fn refresh_current_source(&self) -> Result<PlaybackPreparation, AppError> {
         let state = self.playback_state();
         let song = state.current.as_ref().ok_or(AppError::EmptyQueue)?;
@@ -422,6 +618,7 @@ impl SunnySongApp {
                 expires_at_ms: None,
                 local_path: Some(local.path),
                 request_profile: PlaybackRequestProfile::Web,
+                normalization_gain_metadata: local.normalization_gain_metadata,
             });
         }
         let is_jellyfin = song_id.as_str().starts_with("jellyfin:");
@@ -531,6 +728,14 @@ impl SunnySongApp {
         Ok(self.repository.library_folders()?)
     }
 
+    pub fn local_scan_state(&self, directory_id: i64) -> Result<Vec<ScannedLocalTrack>, AppError> {
+        Ok(self.repository.local_scan_state(directory_id)?)
+    }
+
+    pub fn referenced_local_artwork(&self) -> Result<Vec<String>, AppError> {
+        Ok(self.repository.referenced_local_artwork()?)
+    }
+
     pub fn store_directory_scan(
         &self,
         directory_id: i64,
@@ -563,6 +768,16 @@ impl SunnySongApp {
             error,
             attempted_at_ms,
         )?)
+    }
+
+    pub fn mark_local_file_missing(
+        &self,
+        canonical_path: &str,
+        missing_since_ms: i64,
+    ) -> Result<(), AppError> {
+        Ok(self
+            .repository
+            .mark_local_file_missing(canonical_path, missing_since_ms)?)
     }
 
     pub fn local_artists(
@@ -750,8 +965,164 @@ impl SunnySongApp {
             .add_song_to_playlist(playlist_id, song, now_ms)?)
     }
 
+    pub fn rename_playlist(
+        &self,
+        playlist_id: &str,
+        name: &str,
+        now_ms: i64,
+    ) -> Result<crate::Playlist, AppError> {
+        Ok(self.repository.rename_playlist(playlist_id, name, now_ms)?)
+    }
+
+    pub fn delete_playlist(&self, playlist_id: &str) -> Result<(), AppError> {
+        Ok(self.repository.delete_playlist(playlist_id)?)
+    }
+
+    pub fn remove_song_from_playlist(
+        &self,
+        playlist_id: &str,
+        song_id: &crate::domain::SongId,
+        now_ms: i64,
+    ) -> Result<(), AppError> {
+        Ok(self
+            .repository
+            .remove_song_from_playlist(playlist_id, song_id, now_ms)?)
+    }
+
+    pub fn reorder_playlist_tracks(
+        &self,
+        playlist_id: &str,
+        song_ids: &[String],
+        now_ms: i64,
+    ) -> Result<Vec<crate::PlaylistTrack>, AppError> {
+        Ok(self
+            .repository
+            .reorder_playlist_tracks(playlist_id, song_ids, now_ms)?)
+    }
+
+    pub fn playlist_export_tracks(
+        &self,
+        playlist_id: &str,
+    ) -> Result<Vec<crate::PlaylistExportTrack>, AppError> {
+        Ok(self.repository.playlist_export_tracks(playlist_id)?)
+    }
+
+    pub fn song_by_id(&self, song_id: &crate::domain::SongId) -> Result<Option<Song>, AppError> {
+        Ok(self.repository.song_by_id(song_id)?)
+    }
+
+    pub fn song_by_local_path(&self, path: &std::path::PathBuf) -> Result<Option<Song>, AppError> {
+        Ok(self.repository.song_by_local_path(path)?)
+    }
+
+    pub fn create_playlist_from_songs(
+        &self,
+        name: &str,
+        song_ids: &[crate::domain::SongId],
+        now_ms: i64,
+    ) -> Result<crate::Playlist, AppError> {
+        Ok(self
+            .repository
+            .create_playlist_from_songs(name, song_ids, now_ms)?)
+    }
+
+    pub fn create_backup(&self, destination: &std::path::PathBuf) -> Result<(), AppError> {
+        Ok(self.repository.create_backup(destination)?)
+    }
+
     pub fn liked_song_ids(&self) -> Result<Vec<String>, AppError> {
         Ok(self.repository.liked_song_ids()?)
+    }
+
+    pub fn liked_songs(&self, limit: usize, offset: usize) -> Result<Vec<Song>, AppError> {
+        Ok(self.repository.liked_songs(limit, offset)?)
+    }
+
+    pub fn history_events(
+        &self,
+        limit: usize,
+        before: Option<i64>,
+    ) -> Result<Vec<crate::HistoryEvent>, AppError> {
+        Ok(self.repository.history_events(limit, before)?)
+    }
+
+    pub fn delete_history_event(&self, event_id: &str) -> Result<(), AppError> {
+        Ok(self.repository.delete_history_event(event_id)?)
+    }
+
+    pub fn delete_song_history(&self, song_id: &crate::domain::SongId) -> Result<u64, AppError> {
+        Ok(self.repository.delete_song_history(song_id)?)
+    }
+
+    pub fn clear_history(&self) -> Result<u64, AppError> {
+        Ok(self.repository.clear_history()?)
+    }
+
+    pub fn listening_recap(
+        &self,
+        from_ms: Option<i64>,
+        to_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<crate::ListeningRecap, AppError> {
+        Ok(self.repository.listening_recap(from_ms, to_ms, limit)?)
+    }
+
+    pub fn downloads(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::DownloadRecord>, AppError> {
+        Ok(self.repository.downloads(limit, offset)?)
+    }
+
+    pub fn create_download_attempt(
+        &self,
+        song: &Song,
+        now_ms: i64,
+    ) -> Result<crate::DownloadRecord, AppError> {
+        Ok(self.repository.create_download_attempt(song, now_ms)?)
+    }
+
+    pub fn finish_download_attempt(
+        &self,
+        id: &str,
+        status: &str,
+        location: Option<&str>,
+        file_name: Option<&str>,
+        error: Option<&str>,
+        now_ms: i64,
+    ) -> Result<(), AppError> {
+        Ok(self
+            .repository
+            .finish_download_attempt(id, status, location, file_name, error, now_ms)?)
+    }
+
+    pub fn remove_download(&self, id: &str) -> Result<(), AppError> {
+        Ok(self.repository.remove_download(id)?)
+    }
+
+    pub async fn search_suggestions(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, AppError> {
+        let query = query.trim();
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut suggestions = self.repository.local_text_suggestions(query, limit)?;
+        if suggestions.len() < limit && self.repository.discovery_enabled()? {
+            if let Ok(remote) = self.provider.search_suggestions(query, limit).await {
+                suggestions.extend(remote);
+            }
+        }
+        let mut seen = HashSet::new();
+        suggestions.retain(|value| {
+            let value = value.trim();
+            !value.is_empty() && seen.insert(value.to_lowercase())
+        });
+        suggestions.truncate(limit);
+        Ok(suggestions)
     }
 
     pub fn recent_songs(
@@ -924,6 +1295,7 @@ impl SunnySongApp {
             !exclude.contains(id) && !queue_ids.contains(id)
         });
         ordered.extend(local_candidates);
+        let ordered = deduplicate_recommendations_by_song_family(ordered);
         let candidate_count = ordered.len();
         let picks = diversify_by_artist(ordered, limit, artist_cap);
         let discovery_count = picks
@@ -943,6 +1315,65 @@ impl SunnySongApp {
             duration_ms = started.elapsed().as_millis() as u64
         );
         Ok(picks)
+    }
+
+    pub async fn discover_feed(
+        &self,
+        section_limit: usize,
+        now_ms: i64,
+    ) -> Result<Vec<DiscoverSection>, AppError> {
+        let limit = section_limit.clamp(1, 20);
+        let mut excluded = HashSet::new();
+        let definitions = [
+            (
+                "favorites",
+                "Based on your favorites",
+                "Songs ranked from your listening and reaction history",
+                QuickPickOptions {
+                    diverse: true,
+                    new_songs: false,
+                    rediscover: true,
+                },
+            ),
+            (
+                "unheard",
+                "Explore something new",
+                "Underplayed library songs and discovery results when enabled",
+                QuickPickOptions {
+                    diverse: true,
+                    new_songs: true,
+                    rediscover: false,
+                },
+            ),
+            (
+                "rediscover",
+                "Rediscover",
+                "Familiar songs you have not heard as recently",
+                QuickPickOptions {
+                    diverse: true,
+                    new_songs: false,
+                    rediscover: true,
+                },
+            ),
+        ];
+        let mut sections = Vec::new();
+        for (id, title, description, options) in definitions {
+            let items = self.quick_picks(limit, now_ms, &excluded, options).await?;
+            excluded.extend(
+                items
+                    .iter()
+                    .map(|item| item.profile.song.id.as_str().to_owned()),
+            );
+            if !items.is_empty() {
+                sections.push(DiscoverSection {
+                    id: id.into(),
+                    title: title.into(),
+                    description: description.into(),
+                    items,
+                });
+            }
+        }
+        Ok(sections)
     }
 }
 
@@ -1013,6 +1444,112 @@ fn diversify_by_artist(
     selected
 }
 
+fn canonical_song_text(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+        .collect()
+}
+
+fn base_song_title(title: &str) -> String {
+    const VARIANT_MARKERS: [&str; 10] = [
+        "remix",
+        "remaster",
+        "radio edit",
+        "extended mix",
+        "club mix",
+        "original mix",
+        "official audio",
+        "official lyric",
+        "lyric video",
+        "visualizer",
+    ];
+
+    let lowered = title.to_lowercase();
+    let mut base = String::with_capacity(lowered.len());
+    let mut segment = String::new();
+    let mut closing = None;
+    for character in lowered.chars() {
+        match (closing, character) {
+            (None, '(') => {
+                segment.clear();
+                closing = Some(')');
+            }
+            (None, '[') => {
+                segment.clear();
+                closing = Some(']');
+            }
+            (Some(expected), value) if value == expected => {
+                if !VARIANT_MARKERS
+                    .iter()
+                    .any(|marker| segment.contains(marker))
+                {
+                    base.push(' ');
+                    base.push_str(&segment);
+                }
+                closing = None;
+            }
+            (Some(_), value) => segment.push(value),
+            (None, value) => base.push(value),
+        }
+    }
+    if closing.is_some() {
+        base.push(' ');
+        base.push_str(&segment);
+    }
+
+    let mut cutoff = base.len();
+    for separator in [" - ", " – ", " — "] {
+        for (index, _) in base.match_indices(separator) {
+            let suffix = &base[index + separator.len()..];
+            if VARIANT_MARKERS.iter().any(|marker| suffix.contains(marker)) {
+                cutoff = cutoff.min(index);
+            }
+        }
+    }
+    base.truncate(cutoff);
+    canonical_song_text(&base)
+}
+
+fn song_family_key(song: &Song) -> String {
+    format!(
+        "{}:{}",
+        canonical_song_text(&song.artist.name),
+        base_song_title(&song.title)
+    )
+}
+
+fn deduplicate_recommendations_by_song_family(
+    candidates: Vec<RecommendedSong>,
+) -> Vec<RecommendedSong> {
+    let mut best = HashMap::<String, RecommendedSong>::new();
+    for candidate in candidates {
+        let key = song_family_key(&candidate.profile.song);
+        match best.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if candidate.score > entry.get().score {
+                    entry.insert(candidate);
+                }
+            }
+        }
+    }
+    let mut selected = best.into_values().collect::<Vec<_>>();
+    selected.sort_by(|left, right| {
+        right.score.total_cmp(&left.score).then_with(|| {
+            left.profile
+                .song
+                .id
+                .as_str()
+                .cmp(right.profile.song.id.as_str())
+        })
+    });
+    selected
+}
+
 fn rank_queue_candidates(mut candidates: Vec<Song>, recent: &[crate::RecentSong]) -> Vec<Song> {
     let recent_artist_weight = recent.iter().enumerate().fold(
         HashMap::<String, f64>::new(),
@@ -1064,6 +1601,8 @@ fn rank_queue_candidates(mut candidates: Vec<Song>, recent: &[crate::RecentSong]
             .total_cmp(&score(left))
             .then_with(|| left.id.as_str().cmp(right.id.as_str()))
     });
+    let mut seen_families = HashSet::new();
+    candidates.retain(|song| seen_families.insert(song_family_key(song)));
     candidates
 }
 
@@ -1113,6 +1652,7 @@ mod tests {
                 expires_at_ms: None,
                 local_path: None,
                 request_profile: PlaybackRequestProfile::Web,
+                normalization_gain_metadata: None,
             })
         }
     }
@@ -1145,6 +1685,15 @@ mod tests {
             &self,
             _song_id: &SongId,
         ) -> Result<PlaybackSource, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ProviderError::Unavailable)
+        }
+
+        async fn search_suggestions(
+            &self,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<Vec<String>, ProviderError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Err(ProviderError::Unavailable)
         }
@@ -1199,6 +1748,13 @@ mod tests {
         fn set_discovery_enabled(&self, enabled: bool, _now_ms: i64) -> Result<(), StorageError> {
             self.enabled.store(enabled, Ordering::SeqCst);
             Ok(())
+        }
+        fn local_text_suggestions(
+            &self,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<Vec<String>, StorageError> {
+            Ok(vec!["Local suggestion".into()])
         }
     }
 
@@ -1311,6 +1867,35 @@ mod tests {
     }
 
     #[test]
+    fn queue_ranking_keeps_only_the_best_scored_song_variant() {
+        let mut original = song("original-upload");
+        original.title = "Midnight Drive".into();
+        original.artist.name = "Sunny Artist".into();
+        let mut duplicate = song("later-upload");
+        duplicate.title = "Midnight Drive (Official Audio)".into();
+        duplicate.artist.name = "Sunny Artist".into();
+        let mut remix = song("remix-upload");
+        remix.title = "Midnight Drive - Club Remix".into();
+        remix.artist.name = "Sunny Artist".into();
+
+        let ranked = rank_queue_candidates(vec![original.clone(), duplicate, remix], &[]);
+        assert_eq!(ranked, vec![original]);
+    }
+
+    #[test]
+    fn semantic_song_families_do_not_merge_different_artists() {
+        let mut first = song("first-artist");
+        first.title = "Home".into();
+        first.artist.name = "Artist One".into();
+        let mut second = song("second-artist");
+        second.title = "Home (Remix)".into();
+        second.artist.name = "Artist Two".into();
+
+        assert_ne!(song_family_key(&first), song_family_key(&second));
+        assert_eq!(rank_queue_candidates(vec![first, second], &[]).len(), 2);
+    }
+
+    #[test]
     fn online_discovery_fills_slots_when_local_library_is_small() {
         assert_eq!(online_discovery_target(4, 0, true), 4);
         assert_eq!(online_discovery_target(4, 1, true), 3);
@@ -1334,6 +1919,26 @@ mod tests {
 
         assert!(app.search_discovery("test", 10).await.unwrap().is_empty());
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn suggestion_provider_failure_returns_accumulated_local_results() {
+        let provider = Arc::new(DiscoveryTestProvider {
+            calls: AtomicUsize::new(0),
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        let repository = Arc::new(DiscoveryTestRepository {
+            enabled: AtomicBool::new(true),
+            saved: AtomicUsize::new(0),
+        });
+        let app = SunnySongApp::new(provider.clone(), repository);
+
+        assert_eq!(
+            app.search_suggestions("local", 10).await.unwrap(),
+            vec!["Local suggestion"]
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1376,6 +1981,53 @@ mod tests {
         assert!(search.await.unwrap().unwrap().is_empty());
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         assert_eq!(repository.saved.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn preparing_next_source_does_not_mutate_queue_state() {
+        let first = song("first");
+        let second = song("second");
+        let provider = Arc::new(FakeProvider {
+            fail_second: AtomicBool::new(false),
+            second: second.clone(),
+        });
+        let app = SunnySongApp::new(provider, Arc::new(FakeRepository::default()));
+        app.play_song(first.clone()).await.unwrap();
+        app.hydrate_queue(&first.id).await.unwrap();
+        let before = app.playback_state();
+
+        let source = app.prepare_next_playback_source(&second.id).await.unwrap();
+        let after = app.playback_state();
+
+        assert!(source.url.contains(second.id.as_str()));
+        assert_eq!(after.current, before.current);
+        assert_eq!(after.current_index, before.current_index);
+        assert_eq!(after.queue, before.queue);
+    }
+
+    #[tokio::test]
+    async fn preparing_next_source_rejects_a_non_next_song() {
+        let first = song("first");
+        let second = song("second");
+        let provider = Arc::new(FakeProvider {
+            fail_second: AtomicBool::new(false),
+            second: second.clone(),
+        });
+        let app = SunnySongApp::new(provider, Arc::new(FakeRepository::default()));
+        app.play_song(first.clone()).await.unwrap();
+        app.hydrate_queue(&first.id).await.unwrap();
+        app.enqueue_song(song("later")).unwrap();
+        let before = app.playback_state();
+
+        assert!(matches!(
+            app.prepare_next_playback_source(&SongId::new("later").unwrap())
+                .await,
+            Err(AppError::InvalidQueueOperation(_))
+        ));
+        let after = app.playback_state();
+        assert_eq!(after.current, before.current);
+        assert_eq!(after.current_index, before.current_index);
+        assert_eq!(after.queue, before.queue);
     }
 
     #[tokio::test]
@@ -1428,6 +2080,12 @@ mod tests {
             local_file: Some(LocalPlaybackFile {
                 path: "/music/track.flac".into(),
                 mime_type: "audio/flac".into(),
+                normalization_gain_metadata: Some(crate::NormalizationGainMetadata {
+                    track_gain_db: Some(-7.5),
+                    album_gain_db: Some(-5.0),
+                    track_peak: Some(0.98),
+                    album_peak: Some(1.0),
+                }),
             }),
             discovery_enabled: false,
             ..FakeRepository::default()
@@ -1440,6 +2098,15 @@ mod tests {
             Some(std::path::PathBuf::from("/music/track.flac"))
         );
         assert!(preparation.source.url.is_empty());
+        assert_eq!(
+            preparation.source.normalization_gain_metadata,
+            Some(crate::NormalizationGainMetadata {
+                track_gain_db: Some(-7.5),
+                album_gain_db: Some(-5.0),
+                track_peak: Some(0.98),
+                album_peak: Some(1.0),
+            })
+        );
     }
 
     #[tokio::test]
@@ -1534,6 +2201,51 @@ mod tests {
             .map(|candidate| candidate.id.as_str())
             .collect::<HashSet<_>>();
         assert_eq!(unique_ids.len(), refilled.queue.len());
+    }
+
+    #[tokio::test]
+    async fn queue_editing_keeps_current_identity_and_play_next_is_immediate() {
+        let first = song("first");
+        let provider = Arc::new(FakeProvider {
+            fail_second: AtomicBool::new(false),
+            second: song("unused"),
+        });
+        let app = SunnySongApp::new(provider, Arc::new(FakeRepository::default()));
+        app.play_song(first.clone()).await.unwrap();
+        app.enqueue_song(song("later")).unwrap();
+        app.enqueue_next(song("next")).unwrap();
+        app.enqueue_next(song("later")).unwrap();
+        assert_eq!(
+            app.playback_state()
+                .queue
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "later", "next"]
+        );
+        app.move_queue_item(2, 1).unwrap();
+        app.remove_queue_item(2).unwrap();
+        let state = app.clear_upcoming().unwrap();
+        assert_eq!(state.queue, vec![first.clone()]);
+        assert_eq!(state.current, Some(first));
+        assert!(app.remove_queue_item(0).is_err());
+    }
+
+    #[tokio::test]
+    async fn replace_queue_deduplicates_and_prepares_selected_song() {
+        let provider = Arc::new(FakeProvider {
+            fail_second: AtomicBool::new(false),
+            second: song("unused"),
+        });
+        let app = SunnySongApp::new(provider, Arc::new(FakeRepository::default()));
+        let selected = song("selected");
+        let preparation = app
+            .replace_queue(vec![song("first"), selected.clone(), selected.clone()], 2)
+            .await
+            .unwrap();
+        assert_eq!(preparation.state.queue.len(), 2);
+        assert_eq!(preparation.state.current, Some(selected));
+        assert_eq!(preparation.state.current_index, Some(1));
     }
 
     #[tokio::test]

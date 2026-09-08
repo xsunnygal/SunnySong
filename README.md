@@ -8,9 +8,9 @@ SunnySong is a local-first music player for Android and Linux. It combines music
 
 - Local folders and Jellyfin libraries work without enabling online Discovery.
 - Optional YouTube Music search, recommendations, lyrics, and playback.
-- Profile-isolated history, likes, affinity, Recently Played, and Quick Picks.
-- Persistent queue, repeat-one, resilient buffered playback, and Android media controls.
-- Local playlists, downloads with metadata, album/artist browsing, and configurable recommendation diversity.
+- Profile-isolated history, likes, listening recap, Recently Played, Quick Picks, and Discover feeds.
+- Persistent queue, repeat-one, resilient buffered playback, Android media controls, and Linux MPRIS.
+- Local playlists with desktop M3U import/export, paged downloads with metadata, album/artist browsing, and desktop backup/restore.
 - Svelte 5 interface with a Rust/Tauri 2 backend and SQLite persistence.
 
 ## Development
@@ -21,7 +21,7 @@ Requirements:
 - Rust toolchain
 - Tauri 2 system dependencies
 - Java 17 plus Android SDK/NDK for Android builds
-- WebKitGTK and GStreamer codecs for Linux
+- WebKitGTK and GStreamer codecs for Linux development (release AppImages bundle their GStreamer runtime)
 
 ```bash
 npm install
